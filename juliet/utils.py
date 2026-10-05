@@ -2,116 +2,19 @@ import numpy as np
 from astropy.io import fits
 import astropy.constants as const
 import pickle
-import batman
-import radvel
-# Try to import catwoman:
-try:
-    import catwoman
-    have_catwoman = True
-except:
-    have_catwoman = False
 
-# Try to import jax and kelp
-try:
-    # jax
-    import jax
-    jax.config.update(
-        "jax_enable_x64", True
-    )  #
-    # Kelp
-    from kelp.jax import reflected_phase_curve, thermal_phase_curve, reflected_phase_curve_inhomogeneous
-    jitted_homo_refl_pc = jax.jit(reflected_phase_curve)
-    jitted_inhomo_refl_pc = reflected_phase_curve_inhomogeneous       # There may be some issue with kelp, which is causing error when I use jax.jit with this function
-    jitted_thermal_pc = jax.jit(thermal_phase_curve)
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
 
-    # scipy interpolate
-    from scipy.interpolate import interp1d
-
-except:
-    print(
-        'Warning: no jax and/or kelp installation found. No kelp phase curves will be able to be used.'
-    )
+# kelp phase curves (vendored from the kelp package; see kelp_jax.py):
+from .kelp_jax import reflected_phase_curve, thermal_phase_curve, reflected_phase_curve_inhomogeneous
+jitted_homo_refl_pc = jax.jit(reflected_phase_curve)
+jitted_inhomo_refl_pc = jax.jit(reflected_phase_curve_inhomogeneous)
+jitted_thermal_pc = jax.jit(thermal_phase_curve)
 
 from .KeplerOrbit import KeplerOrbit
 
-
-def init_batman(t, ld_law, nresampling=None, etresampling=None):
-     """
-     This function initializes the batman code.
-     """
-
-     params = batman.TransitParams()
-     params.t0 = 0. 
-     params.per = 1. 
-     params.rp = 0.1
-     params.a = 15.
-     params.inc = 87.
-     params.ecc = 0. 
-     params.w = 90.
-
-     if ld_law == 'linear':
-
-         params.u = [0.5]
-
-     elif ld_law == 'nonlinear':
-
-         params.u = [0.1, 0.1, 0.1, 0.1]
-
-     else:
-
-         params.u = [0.1,0.3]
-
-     if ld_law == 'none':
-
-         params.limb_dark = 'quadratic'
-
-     else:
-
-         params.limb_dark = ld_law
-
-     params.fp = 0.001
-     
-     params.t_secondary = params.t0 + (params.per/2)
-
-     if nresampling is None or etresampling is None:
-
-         m = [batman.TransitModel(params, t), batman.TransitModel(params, t, transittype='secondary')]
-
-     else:
-
-         m = [batman.TransitModel(params, t, supersample_factor=nresampling, exp_time=etresampling),\
-             batman.TransitModel(params, t, transittype='secondary', supersample_factor=nresampling, exp_time=etresampling)]
-
-     return params,m
-
-def init_catwoman(t, ld_law, nresampling = None, etresampling = None):
-    """  
-    This function initializes the catwoman code.
-    """
-
-    params = catwoman.TransitParams()
-    params.t0 = 0.
-    params.per = 1.
-    params.rp = 0.1
-    params.rp2 = 0.1
-    params.a = 15.
-    params.inc = 87.
-    params.ecc = 0.
-    params.w = 90.
-    params.phi = 90.
-    if ld_law == 'linear':
-        params.u = [0.5]
-    else:
-        params.u = [0.1, 0.3]
-    params.limb_dark = ld_law
-    if nresampling is None or etresampling is None:
-        m = catwoman.TransitModel(params, t)
-    else:
-        m = catwoman.TransitModel(params,
-                                  t,
-                                  supersample_factor=nresampling,
-                                  exp_time=etresampling)
-    return params, m
 
 def correct_light_travel_time(times, params):
     '''Correct for the finite light travel speed.
@@ -167,10 +70,6 @@ def correct_light_travel_time(times, params):
     # Batman will then calculate the model at a slightly earlier time
     return times-delta_t.flatten()
 
-def init_radvel(nplanets=1):
-    return radvel.model.Parameters(nplanets, basis='per tc e w k')
-
-
 def kelp_homogeneous_refl_pc_model(times, t0, per, ar, rprs, g, single_scat_albedo, nknots):
     """
     This helper function computes the reflected light phase curve for homogeneously reflected planet 
@@ -211,10 +110,10 @@ def kelp_homogeneous_refl_pc_model(times, t0, per, ar, rprs, g, single_scat_albe
 
     # Converting times to phases:
     phases_unsorted = ((times- t0) % per) / per                       ## Un-sorted phases
-    idx_phase_sort = np.argsort(phases_unsorted)                      ## This would sort any array acc to phase
+    idx_phase_sort = jnp.argsort(phases_unsorted)                      ## This would sort any array acc to phase
     phases_sorted = phases_unsorted[idx_phase_sort]                   ## Sorted phase array
     times_sorted_acc_phs = times[idx_phase_sort]                      ## Time array sorted acc to phase
-    idx_that_sort_arr_acc_times = np.argsort(times_sorted_acc_phs)    ## This array would sort array acc to time
+    idx_that_sort_arr_acc_times = jnp.argsort(times_sorted_acc_phs)    ## This array would sort array acc to time
 
     # Reflective phase curve (homogeneous)
     if nknots is None:
@@ -225,16 +124,13 @@ def kelp_homogeneous_refl_pc_model(times, t0, per, ar, rprs, g, single_scat_albe
         # interpolate on this grid to find Fp/F* for any given phase curves
 
         # Generating uniformally spaced orbital phases
-        uniformally_spaced_phases = np.linspace(phases_sorted[0], phases_sorted[-1], nknots)
+        uniformally_spaced_phases = jnp.linspace(phases_sorted[0], phases_sorted[-1], nknots)
 
         # Using kelp to find Fp/F* for these phases
         refl_fl_ppm_for_uni_phases, _, _ = jitted_homo_refl_pc(phases=uniformally_spaced_phases, omega=single_scat_albedo, g=g, a_rp=ar/rprs)
         
         # Performing interpolation
-        interp1d_refl_pc = interp1d(x=uniformally_spaced_phases, y=refl_fl_ppm_for_uni_phases)
-        
-        # Generating Fp/F* for given orbital phases
-        refl_fl_ppm = interp1d_refl_pc(x=phases_sorted)
+        refl_fl_ppm = jnp.interp(phases_sorted, uniformally_spaced_phases, refl_fl_ppm_for_uni_phases)
 
     refl_pc_sorted_acc_time = refl_fl_ppm[idx_that_sort_arr_acc_times]/1e6
 
@@ -291,10 +187,10 @@ def kelp_inhomogeneous_refl_pc_model(times, t0, per, ar, rprs, w0, wp, Ag, x1, x
 
     # Converting times to phases:
     phases_unsorted = ((times- t0) % per) / per                       ## Un-sorted phases
-    idx_phase_sort = np.argsort(phases_unsorted)                     ## This would sort any array acc to phase
+    idx_phase_sort = jnp.argsort(phases_unsorted)                     ## This would sort any array acc to phase
     phases_sorted = phases_unsorted[idx_phase_sort]                   ## Sorted phase array
     times_sorted_acc_phs = times[idx_phase_sort]                      ## Time array sorted acc to phase
-    idx_that_sort_arr_acc_times = np.argsort(times_sorted_acc_phs)   ## This array would sort array acc to time
+    idx_that_sort_arr_acc_times = jnp.argsort(times_sorted_acc_phs)   ## This array would sort array acc to time
     
     # Reflective phase curve (inhomogeneous)
     if nknots is None:
@@ -305,16 +201,13 @@ def kelp_inhomogeneous_refl_pc_model(times, t0, per, ar, rprs, w0, wp, Ag, x1, x
         # interpolate on this grid to find Fp/F* for any given phase curves
 
         # Generating uniformally spaced orbital phases
-        uniformally_spaced_phases = np.linspace(phases_sorted[0], phases_sorted[-1], nknots)
+        uniformally_spaced_phases = jnp.linspace(phases_sorted[0], phases_sorted[-1], nknots)
 
         # Using kelp to find Fp/F* for these phases
         refl_fl_ppm_for_uni_phases, _, _ = jitted_inhomo_refl_pc(phases=uniformally_spaced_phases, omega_0=w0, omega_prime=wp, x1=x1, x2=x2, A_g=Ag, a_rp=ar/rprs)
         
         # Performing interpolation
-        interp1d_refl_pc = interp1d(x=uniformally_spaced_phases, y=refl_fl_ppm_for_uni_phases)
-        
-        # Generating Fp/F* for given orbital phases
-        refl_fl_ppm = interp1d_refl_pc(x=phases_sorted)
+        refl_fl_ppm = jnp.interp(phases_sorted, uniformally_spaced_phases, refl_fl_ppm_for_uni_phases)
 
     refl_pc_sorted_acc_time = refl_fl_ppm[idx_that_sort_arr_acc_times]/1e6
     
@@ -388,10 +281,10 @@ def kelp_thermal_pc_model(times, t0, per, ar, rprs, filter_wavelength, filter_tr
     
     # Converting times to phases:
     phases_unsorted = ((times- t0) % per) / per                       ## Un-sorted phases
-    idx_phase_sort = np.argsort(phases_unsorted)                     ## This would sort any array acc to phase
+    idx_phase_sort = jnp.argsort(phases_unsorted)                     ## This would sort any array acc to phase
     phases_sorted = phases_unsorted[idx_phase_sort]                   ## Sorted phase array
     times_sorted_acc_phs = times[idx_phase_sort]                      ## Time array sorted acc to phase
-    idx_that_sort_arr_acc_times = np.argsort(times_sorted_acc_phs)   ## This array would sort array acc to time
+    idx_that_sort_arr_acc_times = jnp.argsort(times_sorted_acc_phs)   ## This array would sort array acc to time
 
     ## Parameters for creating meshgrid
     phi_ang = np.linspace(-2 * np.pi, 2 * np.pi, nphi)
@@ -404,7 +297,7 @@ def kelp_thermal_pc_model(times, t0, per, ar, rprs, filter_wavelength, filter_tr
     ### Thermal phase curve
     if nknots is None:
         thermal_pc, _ = jitted_thermal_pc(
-            xi=xi, hotspot_offset=np.radians(hotspot_offset), omega_drag=omega_drag, alpha=alpha, C_11=c11, T_s=Teff, a_rs=ar, rp_a=rprs/ar,\
+            xi=xi, hotspot_offset=jnp.radians(hotspot_offset), omega_drag=omega_drag, alpha=alpha, C_11=c11, T_s=Teff, a_rs=ar, rp_a=rprs/ar,\
             A_B=0., theta2d=theta2d, phi2d=phi2d, filt_wavelength=filter_wavelength, filt_transmittance=filter_transmittance, f=fprime
         )
     else:
@@ -413,21 +306,18 @@ def kelp_thermal_pc_model(times, t0, per, ar, rprs, filter_wavelength, filter_tr
         # interpolate on this grid to find Fp/F* for any given phase curves
 
         # Generating uniformally spaced orbital phases
-        uniformally_spaced_phases = np.linspace(phases_sorted[0], phases_sorted[-1], nknots)
+        uniformally_spaced_phases = jnp.linspace(phases_sorted[0], phases_sorted[-1], nknots)
         uniformally_spaced_xi = 2 * np.pi * (uniformally_spaced_phases - 0.5)
 
         # Using kelp to find Fp/F* for these phases
         thm_fl_for_uni_phases, _ = jitted_thermal_pc(
-            xi=uniformally_spaced_xi, hotspot_offset=np.radians(hotspot_offset), omega_drag=omega_drag, alpha=alpha, C_11=c11,\
+            xi=uniformally_spaced_xi, hotspot_offset=jnp.radians(hotspot_offset), omega_drag=omega_drag, alpha=alpha, C_11=c11,\
             T_s=Teff, a_rs=ar, rp_a=rprs/ar, A_B=0., theta2d=theta2d, phi2d=phi2d,\
             filt_wavelength=filter_wavelength, filt_transmittance=filter_transmittance, f=fprime
         )
         
         # Performing interpolation
-        interp1d_thm_pc = interp1d(x=uniformally_spaced_xi, y=thm_fl_for_uni_phases)
-        
-        # Generating Fp/F* for given orbital phases
-        thermal_pc = interp1d_thm_pc(x=xi)
+        thermal_pc = jnp.interp(xi, uniformally_spaced_xi, thm_fl_for_uni_phases)
 
     thm_pc_sorted_acc_time = thermal_pc[idx_that_sort_arr_acc_times]
     
@@ -622,7 +512,7 @@ def transform_beta(x, hyperparameters):
     return beta.ppf(x, a, b)
 
 def transform_exponential(x, hyperparameters):
-    a = hyperparameters
+    a = np.atleast_1d(hyperparameters)[0]
     return gamma.ppf(x, a)
 
 def transform_truncated_normal(x, hyperparameters):
@@ -658,14 +548,14 @@ def evaluate_normal(x, hyperparameters):
 
 def evaluate_beta(x, hyperparameters):
     a, b = hyperparameters
-    if a > 0 and b < 1:
+    if x > 0 and x < 1:
         return beta.logpdf(x, a, b)
     else:
         return -np.inf
 
 def evaluate_exponential(x, hyperparameters):
 
-    a = hyperparameters
+    a = np.atleast_1d(hyperparameters)[0]
 
     if x > 0:
 
@@ -988,7 +878,8 @@ def get_quantiles(dist, alpha=0.68, method='median'):
     param = 0.0
     # Define the number of samples from posterior
     nsamples = len(dist)
-    nsamples_at_each_side = int(nsamples * (alpha / 2.) + 1)
+    # (capped so that the indices below stay within the array for small numbers of samples)
+    nsamples_at_each_side = min(int(nsamples * (alpha / 2.) + 1), nsamples // 2 - 2 if nsamples % 2 == 0 else (nsamples - 1) // 2)
     if (method == 'median'):
         med_idx = 0
         if (nsamples % 2 == 0.0):  # Number of points is even

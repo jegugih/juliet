@@ -1,107 +1,23 @@
-# Import batman, for lightcurve models:
-import batman
-# Try to import catwoman:
-try:
-    import catwoman
-    have_catwoman = True
+# juliet's backend is written in JAX: lightcurves and radial-velocities are computed with jaxoplanet,
+# Gaussian Processes with celerite2's kernels and a JAX celerite solver (or dense JAX GPs for the george-like kernels), and the
+# posteriors are sampled with JAX samplers (blackjax's nested slice sampling or numpyro's MCMCs).
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
 
-    major,minor,bug = catwoman.__version__.split('.')
-    if int(major) < 1 or (int(major) == 1 and int(minor) < 1):
-
-        print('Warning: you are using a version of catwoman which is < 1.1.0; this can significantly bias your results (see Holmberg+2026). Please upgrade your version of catwoman to 1.1.0 and above.')
-
-except:
-    have_catwoman = False
-
-# Import radvel, for RV models:
-import radvel
-# Import george for detrending:
-try:
-    import george
-except:
-    print(
-        'Warning: no george installation found. No non-celerite GPs will be able to be used'
-    )
-# Import celerite for detrending:
-try:
-    import celerite
-    from celerite import terms
-
-    # This class was written by Daniel Foreman-Mackey for his paper:
-    # https://github.com/dfm/celerite/blob/master/paper/figures/rotation/rotation.ipynb
-    class RotationTerm(terms.Term):
-        parameter_names = ("log_amp", "log_timescale", "log_period",
-                           "log_factor")
-
-        def get_real_coefficients(self, params):
-            log_amp, log_timescale, log_period, log_factor = params
-            f = np.exp(log_factor)
-            return (
-                np.exp(log_amp) * (1.0 + f) / (2.0 + f),
-                np.exp(-log_timescale),
-            )
-
-        def get_complex_coefficients(self, params):
-            log_amp, log_timescale, log_period, log_factor = params
-            f = np.exp(log_factor)
-            return (
-                np.exp(log_amp) / (2.0 + f),
-                0.0,
-                np.exp(-log_timescale),
-                2 * np.pi * np.exp(-log_period),
-
-            )
-except:
-    print(
-        'Warning: no celerite installation found. No celerite GPs will be able to be used'
-    )
-
-# Check existence of different samplers. First, import dynesty for (dynamic) nested sampling:
-try:
-    import dynesty
-    from dynesty.utils import resample_equal
-    force_pymultinest = False
-except:
-    force_pymultinest = True
-
-# Import multinest for (importance) nested sampling:
-try:
-    import pymultinest
-    force_dynesty = False
-except:
-    force_dynesty = True
-
-# Emcee for MCMC-ing:
-try:
-  
-    import emcee
-    
-except:
-
-    print(
-        "Warning: no emcee installation found. Will not be able to sample using sampler = 'emcee'."
-    )
-
-# Import zeus for fast MCMC:
-try:
-  
-    import zeus
-    
-except:
-  
-    print(
-        "Warning: no zeus installation found. Will not be able to sample using sampler = 'zeus'."
-    )
-
-# Import generic useful classes:
 import os
 import sys
 import copy
+import time
+import pickle
+import inspect
 import numpy as np
-# Useful imports for parallelization:
-import multiprocessing as mp
-from multiprocessing import Pool
-import contextlib
+
+from numpyro.distributions.transforms import biject_to
+
+from . import jaxmodels as jm
+from .jaxgp import JaxGP, kernel_variables
+from .samplers import run_nested, run_numpyro, chunked_vmap
 
 # Define constants on the code:
 G = 6.67408e-11  # Gravitational constant, mks
@@ -276,7 +192,26 @@ class load(object):
     :param non_linear_functions: (optional, dict)
         Dictionary containing any non-linear functions (`non_linear_functions['function']`) and regressors (`non_linear_functions['regressor']`) that want to be fit.
 
+    :param backend: (optional, string)
+        ``jax`` (default) to compute models with jaxoplanet/celerite2 and sample with JAX samplers, or ``legacy`` to use the
+        original implementation of juliet (batman, catwoman, radvel, george, celerite; MultiNest, dynesty, UltraNest, emcee
+        and zeus as samplers), which requires those packages to be installed.
+
+    :param legacy_gp_parametrization: (optional, boolean)
+        If True, GP kernels use the parametrization of juliet <= 2.2.10, in which the exp-sine-squared kernel used
+        ``log(GP_Gamma)`` (instead of ``GP_Gamma``) as the amplitude of its sine part, and the multi-dimensional
+        squared-exponential and Matern 3/2 kernels had a variance of ``nX * GP_sigma**2`` for ``nX`` regressors (instead
+        of ``GP_sigma**2``). Default is False for the ``jax`` backend and True for the ``legacy`` backend.
+
     """
+
+    def __new__(cls, *args, backend = 'jax', **kwargs):
+        if backend == 'legacy':
+            from .legacy.fit import load as legacy_load
+            return legacy_load(*args, **kwargs)
+        elif backend != 'jax':
+            raise Exception('INPUT ERROR: backend "' + str(backend) + '" not recognized; options are "jax" and "legacy".')
+        return super().__new__(cls)
 
     def data_preparation(self, times, instruments, linear_regressors, non_linear_functions):
         """
@@ -1154,8 +1089,11 @@ class load(object):
                  GPrveparamfile = None, LMlceparamfile = None, LMrveparamfile = None, lctimedef = 'TDB', rvtimedef = 'UTC',\
                  ld_laws = 'quadratic', priorfile = None, lc_n_supersamp = None, lc_exptime_supersamp = None, \
                  lc_instrument_supersamp = None, mag_to_flux = True, verbose = False, matern_eps = 0.01, george_hodlr = True, \
-                 pickle_encoding = None, non_linear_functions = {}, extra_loglikelihood = None):
+                 pickle_encoding = None, non_linear_functions = {}, extra_loglikelihood = None, backend = 'jax',
+                 legacy_gp_parametrization = None):
 
+        self.backend = 'jax'
+        self.legacy_gp_parametrization = False if legacy_gp_parametrization is None else legacy_gp_parametrization
         self.lcfilename = lcfilename
         self.rvfilename = rvfilename
         self.GPlceparamfile = GPlceparamfile
@@ -1276,7 +1214,8 @@ class load(object):
            self.starting_point = starting_point
             
         elif type(priors) == dict:
-            # Dictionary was passed, so save it.
+            # Dictionary was passed, so save it (renaming sigma_w_rv_instrument to sigma_w_instrument, as done for prior files):
+            priors = {('sigma_w_' + k.split('_')[-1] if k[:10] == 'sigma_w_rv' else k): v for k, v in priors.items()}
             self.priors = priors
             # Extract same info as above if-statement but using only the dictionary:
             n_transit, n_rv, numbering_transit, numbering_rv, n_params = readpriors(
@@ -1372,7 +1311,7 @@ class load(object):
             self.GP_lc_arguments, self.global_lc_model = readGPeparams(
                 GPlceparamfile)
         elif GP_regressors_lc is not None:
-            self.GP_lc_arguments = GP_regressors_lc
+            self.GP_lc_arguments = {k: np.array(v, copy=True) for k, v in GP_regressors_lc.items()}
             instruments = set(list(self.GP_lc_arguments.keys()))
 
         # Same thing for RVs:
@@ -1380,7 +1319,7 @@ class load(object):
             self.GP_rv_arguments, self.global_rv_model = readGPeparams(
                 GPrveparamfile)
         elif GP_regressors_rv is not None:
-            self.GP_rv_arguments = GP_regressors_rv
+            self.GP_rv_arguments = {k: np.array(v, copy=True) for k, v in GP_regressors_rv.items()}
             instruments = set(list(self.GP_rv_arguments.keys()))
 
         # Same thing for linear regressors in case they were given in a separate file:
@@ -1475,7 +1414,19 @@ class load(object):
             self.generate_datadict('rv')
 
 
-mcmc_samplers = ['emcee', 'zeus']
+
+# Samplers available in the JAX backend. Nested sampling returns the log-evidence; the MCMC ones don't.
+nested_samplers = ['nested', 'nautilus']
+mcmc_samplers = ['nuts', 'emcee', 'zeus']
+# Names of samplers of previous (non-JAX) juliet versions; these are now run with the JAX nested sampler:
+legacy_nested_samplers = ['multinest', 'dynesty', 'dynamic_dynesty', 'ultranest', 'slicesampler_ultranest']
+
+
+def _matching_kwargs(function, kwargs):
+    """Extract the entries of kwargs that are arguments of function."""
+    names = inspect.signature(function).parameters.keys()
+    return {k: kwargs[k] for k in kwargs if k in names}
+
 
 class fit(object):
     """
@@ -1491,24 +1442,34 @@ class fit(object):
     On top of ``data``, a series of extra keywords can be included:
 
     :param sampler: (optional, string)
-        String defining the sampler to be used on the fit. Current possible options include ``multinest`` to use `PyMultiNest <https://github.com/JohannesBuchner/PyMultiNest>`_ (via importance nested sampling),
-        ``dynesty`` to use `Dynesty <https://github.com/joshspeagle/dynesty>`_'s importance nested sampling, ``dynamic_dynesty`` to use Dynesty's dynamic nested sampling algorithm, ``ultranest`` to use
-        `Ultranest <https://github.com/JohannesBuchner/UltraNest/>`_, ``slicesampler_ultranest`` to use Ultranest's slice sampler and ``emcee`` to use `emcee <https://github.com/dfm/emcee>`_. Default is
-        ``multinest`` if PyMultiNest is installed; ``dynesty`` if not.
+        String defining the sampler to be used on the fit. All samplers are written in JAX:
+
+        - ``nested`` (default): batched nested slice sampling (`blackjax <https://github.com/blackjax-devs/blackjax>`_'s ``nss``). Returns
+          the log-evidence (``lnZ``) along with the posterior samples. On each iteration, ``num_delete`` live points are replaced in
+          parallel. Names of the nested samplers of previous juliet versions (``multinest``, ``dynesty``, ``dynamic_dynesty``,
+          ``ultranest``, ``slicesampler_ultranest``) are mapped to this sampler. It needs many likelihood evaluations (it is fast for
+          cheap likelihoods, especially on GPUs), and for multimodal posteriors its ``lnZ`` can scatter between runs by much more than
+          ``lnZerr`` (new points rarely move between modes); use ``nautilus`` (or compare several seeds) in that case.
+        - ``nuts``: `numpyro <https://num.pyro.ai>`_'s No-U-Turn Sampler, with ``num_chains`` (default 4) chains run vectorized.
+        - ``emcee``: numpyro's affine-invariant ensemble sampler (``AIES``; same algorithm as ``emcee``) with ``nwalkers`` walkers.
+        - ``zeus``: numpyro's ensemble slice sampler (``ESS``; same algorithm as ``zeus``) with ``nwalkers`` walkers.
+        - ``nautilus``: `nautilus <https://nautilus-sampler.readthedocs.io>`_'s neural-network-boosted importance nested
+          sampling (requires the ``nautilus-sampler`` package), with the JAX likelihood evaluated in batches. Returns ``lnZ``;
+          ``lnZerr`` is the approximate importance-sampling error ``1/sqrt(N_eff)``.
 
     :param n_live_points: (optional, int)
-        Number of live-points to use on the nested sampling samplers. Default is 500.
+        Number of live-points to use on the nested sampler. Default is 500.
 
-    :param nwalkers: (optional if using emcee, int)
-        Number of walkers to use by emcee. Default is 100.
+    :param nwalkers: (optional if using emcee or zeus, int)
+        Number of walkers to use by the ensemble samplers. Default is 100.
 
     :param nsteps: (optional if using MCMC, int)
-        Number of steps/jumps to perform on the MCMC run. Default is 300.
+        Number of steps/jumps (per chain/walker) to perform on the MCMC run after the burn-in. Default is 300.
 
     :param nburnin: (optional if using MCMC, int)
-        Number of burnin steps/jumps when performing the MCMC run. Default is 500.
+        Number of burnin (warm-up) steps/jumps when performing the MCMC run. Default is 500.
 
-    :param emcee_factor: (optional, for emcee only, float)
+    :param emcee_factor: (optional, for emcee and zeus only, float)
         Factor multiplying the standard-gaussian ball around which the initial position is perturbed for each walker. Default is 1e-4.
 
     :param ecclim: (optional, float)
@@ -1525,9 +1486,6 @@ class fit(object):
         Time to be substracted to the input times in order to generate the linear and/or quadratic trend to be added to the model.
         Default is 2458460.
 
-    :param nthreads: (optinal, int)
-        Define the number of threads to use within dynesty or emcee. Default is to use just 1. Note this will not impact PyMultiNest or UltraNest runs --- these can be parallelized via MPI only.
-
     :param light_travel_delay: (optinal, bool)
         Boolean indicating if light travel time delay wants to be included on eclipse time calculations.
 
@@ -1537,200 +1495,117 @@ class fit(object):
     :param kelp_refl_interpolation_knots: (optional, int)
         Number of knots in case interpolation is to be performed along phases for kelp reflection phase curves. Default is None.
 
-    In addition, any number of extra optional keywords can be given to the call, which will be directly ingested into the sampler of choice. For a full list of optional keywords for...
+    :param seed: (optional, int)
+        Seed for the random number generator of the samplers. Default is a random seed.
 
-    - ...PyMultiNest, check the docstring of ``PyMultiNest``'s ``run`` `function <https://github.com/JohannesBuchner/PyMultiNest/blob/master/pymultinest/run.py>`_.
+    Extra keywords are passed to the sampler of choice:
 
-    - ...any of the nested sampling algorithms in ``dynesty``, see the docstring on the ``run_nested`` `function <https://dynesty.readthedocs.io/en/latest/api.html#dynesty.dynamicsampler.DynamicSampler.run_nested>`_.
+    - ``nested``: ``num_delete`` (number of live points replaced in parallel per iteration; default ``n_live_points // 2``),
+      ``num_inner_steps`` (slice-sampling steps per new live point; default ``max(5, 2 * ndim)``), ``dlogz`` (stopping criterion on
+      the remaining evidence; default 0.1), ``n_posterior_samples`` (number of equally-weighted posterior samples to return;
+      default ``max(ESS, 1000)``) and ``max_iterations``.
+    - ``nuts``: ``num_chains`` (default 4) and any argument of ``numpyro.infer.NUTS`` (e.g., ``target_accept_prob``). By default, a dense
+      mass matrix is adapted without regularization (``dense_mass = True``, ``regularize_mass_matrix = False``).
+    - ``emcee``/``zeus``: any argument of ``numpyro.infer.AIES``/``numpyro.infer.ESS`` (e.g., ``moves``).
+    - All MCMCs: any argument of ``numpyro.infer.MCMC`` (e.g., ``thinning``, ``progress_bar``).
+    - ``nautilus``: ``n_live_points`` is nautilus' ``n_live`` (nautilus recommends 1000--3000); any argument of
+      ``nautilus.Sampler`` (e.g., ``n_batch``, ``n_networks``) or of ``nautilus.Sampler.run`` (e.g., ``f_live``, ``n_eff``).
+      nautilus spends much of its run time training neural networks on one CPU core. To train them in parallel while the
+      batched likelihood stays in the main process, pass a pool for its sampler calculations, e.g.,
+      ``pool = (None, multiprocessing.get_context('fork').Pool(4))`` (a 'fork' pool does not re-import the calling script).
 
-    - ...the non-dynamic nested sampling algorithm implemented in ``dynesty``, see the docstring on ``dynesty.dynesty.NestedSampler`` in `dynesty's documentation <https://dynesty.readthedocs.io/en/latest/api.html>`_.
+    Note that, as the likelihood is jit-compiled, any ``non_linear_functions`` or ``extra_loglikelihood`` given to ``juliet.load``
+    are best written with ``jax.numpy``. Functions written with NumPy are evaluated through ``jax.pure_callback`` (slower, and not
+    available with ``sampler = 'nuts'``, which needs gradients).
 
-    - ...the dynamic nested sampling in ``dynesty`` check the docstring for ``dynesty.dynesty.DynamicNestedSampler`` in `dynesty's documentation <https://dynesty.readthedocs.io/en/latest/api.html>`_.
-
-    - ...the ``ultranest`` sampler, see the docstring for `ultranest.integrationr.ReactiveNestedSampler` in `ultranest's documentation <https://johannesbuchner.github.io/UltraNest/ultranest.html#ultranest.integrator.ReactiveNestedSampler>`_
-
-    Finally, since ``juliet`` version 2.0.26, the following keywords have been deprecated, and are recommended to be removed from code using ``juliet`` as they
-    will be removed sometime in the future:
-
-    :param use_dynesty: (optional, boolean)
-        If ``True``, use dynesty instead of `MultiNest` for posterior sampling and evidence evaluation. Default is
-        ``False``, unless `MultiNest` via ``pymultinest`` is not working on the system.
-
-    :param dynamic: (optional, boolean)
-        If ``True``, use dynamic Nested Sampling with dynesty. Default is ``False``.
-
-    :param dynesty_bound: (optional, string)
-        Define the dynesty bound method to use (currently either ``single`` or ``multi``, to use either single ellipsoids or multiple
-        ellipsoids). Default is ``multi`` (for details, see the `dynesty API <https://dynesty.readthedocs.io/en/latest/api.html>`_).
-
-    :param dynesty_sample: (optional, string)
-        Define the sampling method for dynesty to use. Default is ``rwalk``. Accorfing to the `dynesty API <https://dynesty.readthedocs.io/en/latest/api.html>`_,
-        this should be changed depending on the number of parameters being fitted. If smaller than about 20, ``rwalk`` is optimal. For larger dimensions,
-        ``slice`` or ``rslice`` should be used.
-
-    :param dynesty_nthreads: (optional, int)
-        Define the number of threads to use within dynesty. Default is to use just 1.
-
-    :param dynesty_n_effective: (optional, int)
-        Minimum number of effective posterior samples when using ``dynesty``. If the estimated “effective sample size” exceeds this number, sampling will terminate. Default is ``None``.
-
-    :param dynesty_use_stop: (optional, boolean)
-        Whether to evaluate the ``dynesty`` stopping function after each batch. Disabling this can improve performance if other stopping criteria such as maxcall are already specified.
-        Default is ``True``.
-
-    :param dynesty_use_pool: (optional, dict)
-        A dictionary containing flags indicating where a pool in ``dynesty`` should be used to execute operations in parallel. These govern whether ``prior_transform`` is executed in parallel during
-        initialization (``'prior_transform'``), loglikelihood is executed in parallel during initialization (``'loglikelihood'``), live points are proposed in parallel during a run
-        (``'propose_point'``), and bounding distributions are updated in parallel during a run (``'update_bound'``). Default is True for all options.
-
+    The following keywords from previous juliet versions are accepted but have no effect in the JAX backend: ``nthreads``,
+    ``use_ultranest``, ``use_dynesty``, ``dynamic``, ``dynesty_bound``, ``dynesty_sample``, ``dynesty_nthreads``,
+    ``dynesty_n_effective``, ``dynesty_use_stop``, ``dynesty_use_pool``, ``dynesty_save_states`` and ``dynesty_resume``.
     """
 
-    def set_prior_transform(self):
-        for pname in self.model_parameters:
-            dist_name = self.data.priors[pname]['distribution'].lower()
-            if dist_name != 'fixed':
-                if dist_name == 'uniform':
-                    self.transform_prior[pname] = transform_uniform
-                if dist_name == 'normal':
-                    self.transform_prior[pname] = transform_normal
-                if dist_name == 'truncatednormal':
-                    self.transform_prior[pname] = transform_truncated_normal
+    def __new__(cls, data, *args, **kwargs):
+        # Data loaded with backend = 'legacy' are handled by the legacy implementation:
+        if getattr(data, 'backend', 'jax') == 'legacy':
+            from .legacy.fit import fit as legacy_class
+            return legacy_class(data, *args, **kwargs)
+        return super().__new__(cls)
 
-                if self.data.priors[pname][
-                        'distribution'] == 'jeffreys' or self.data.priors[
-                            pname]['distribution'] == 'loguniform':
+    # Map between the free parameter vector x (physical units) and the parameter dictionary used by the models:
+    def parameter_dictionary(self, x):
+        pv = dict(self.fixed_values)
+        for i, pname in enumerate(self.paramnames):
+            pv[pname] = x[i]
+        return pv
 
-                    self.transform_prior[pname] = transform_loguniform
-                if dist_name == 'beta':
-                    self.transform_prior[pname] = transform_beta
-                if dist_name == 'exponential':
-                    self.transform_prior[pname] = transform_exponential
-                if dist_name == 'modjeffreys':
-                    self.transform_prior[pname] = transform_modifiedjeffreys
-
-    def set_logpriors(self):
-        for pname in self.model_parameters:
-            dist_name = self.data.priors[pname]['distribution'].lower()
-            if dist_name != 'fixed':
-                if dist_name == 'uniform':
-                    self.evaluate_logprior[pname] = evaluate_uniform
-                if dist_name == 'normal':
-                    self.evaluate_logprior[pname] = evaluate_normal
-                if dist_name == 'truncatednormal':
-                    self.evaluate_logprior[pname] = evaluate_truncated_normal
-
-                if self.data.priors[pname][
-                        'distribution'] == 'jeffreys' or self.data.priors[
-                            pname]['distribution'] == 'loguniform':
-
-                    self.evaluate_logprior[pname] = evaluate_loguniform
-                if dist_name == 'beta':
-                    self.evaluate_logprior[pname] = evaluate_beta
-                if dist_name == 'exponential':
-                    self.evaluate_logprior[pname] = evaluate_exponential
-                if dist_name == 'modjeffreys':
-                    self.evaluate_logprior[pname] = evaluate_modifiedjeffreys
-
-    # Prior transform for nested samplers:
-    def prior_transform(self, cube, ndim=None, nparams=None):
-        pcounter = 0
-        for pname in self.model_parameters:
-            if self.data.priors[pname]['distribution'].lower() != 'fixed':
-                cube[pcounter] = self.transform_prior[pname](cube[pcounter], \
-                                 self.data.priors[pname]['hyperparameters'])
-                pcounter += 1
-
-    # Prior transform for nested samplers (this one spits the transformed priors from the unit cube):
-    def prior_transform_r(self, cube):
-        pcounter = 0
-        transformed_priors = np.copy(self.transformed_priors)
-        for pname in self.model_parameters:
-            if self.data.priors[pname]['distribution'].lower() != 'fixed':
-                transformed_priors[pcounter] = self.transform_prior[pname](cube[pcounter], \
-                                               self.data.priors[pname]['hyperparameters'])
-                pcounter += 1
-        return transformed_priors
-
-    # Log-prior for MCMCs (returns evaluated prior):
-    def logprior(self, theta):
-        pcounter = 0
-        total_logprior = 0.
-        for pname in self.model_parameters:
-            if self.data.priors[pname]['distribution'].lower() != 'fixed':
-                total_logprior += self.evaluate_logprior[pname](theta[pcounter], \
-                                  self.data.priors[pname]['hyperparameters'])
-                pcounter += 1
-        return total_logprior
-
-    def loglike(self, cube, ndim=None, nparams=None):
-        # Evaluate the joint log-likelihood. For this, first extract all inputs:
-        pcounter = 0
-        for pname in self.model_parameters:
-            if self.data.priors[pname]['distribution'].lower() != 'fixed':
-                self.posteriors[pname] = cube[pcounter]
-                pcounter += 1
-        # Initialize log-likelihood:
-        log_likelihood = 0.0
-
-        # Evaluate photometric model first:
+    def _loglike_x(self, x):
+        pv = self.parameter_dictionary(x)
+        log_likelihood = 0.
         if self.data.t_lc is not None:
-            self.lc.generate(self.posteriors)
-            if self.lc.modelOK:
-                log_likelihood += self.lc.get_log_likelihood(self.posteriors)
-            else:
-                return -1e101
-        # Now RV model:
+            log_likelihood = log_likelihood + self.lc.log_likelihood_fn(pv)
         if self.data.t_rv is not None:
-            self.rv.generate(self.posteriors)
-            if self.rv.modelOK:
-                log_likelihood += self.rv.get_log_likelihood(self.posteriors)
-            else:
-                return -1e101
-
+            log_likelihood = log_likelihood + self.rv.log_likelihood_fn(pv)
         # Evaluate any extra likelihoods:
         if self.extra_loglikelihood_boolean:
+            log_likelihood = log_likelihood + self._extra_loglikelihood_fn(pv)
+        return jnp.where(jnp.isnan(log_likelihood), -jnp.inf, log_likelihood)
 
-            log_likelihood += extra_loglikelihood['loglikelihood']( self.posteriors )
+    def _logprior_x(self, x):
+        return sum(d.log_prob(x[i]) for i, d in enumerate(self.prior_dists))
 
-        # This is an extra check if the log-likelihood is non-nan
-        # (I found that fitting kelp inhomogeneous light curve often produces Nan likelihoods, 
-        # so this if statement will prevent that)
-        if np.isnan(log_likelihood):
-            log_likelihood = -1e101
+    # The samplers work on an unconstrained vector z; x = T(z) maps it to the support of each prior:
+    def _x_of_z(self, z):
+        return jnp.stack([T(z[i]) for i, T in enumerate(self.transforms)])
 
-        # Return total log-likelihood:
-        return log_likelihood
+    def _z_of_x(self, x):
+        z = jnp.stack([T.inv(x[..., i]) for i, T in enumerate(self.transforms)], axis=-1)
+        return jnp.where(jnp.isfinite(z), z, 0.)
 
-    # Log-probability for MCMC samplers:
+    def _logprior_z(self, z):
+        lp = 0.
+        for i, (d, T) in enumerate(zip(self.prior_dists, self.transforms)):
+            xi = T(z[i])
+            lp = lp + d.log_prob(xi) + T.log_abs_det_jacobian(z[i], xi)
+        return lp
+
+    def _loglike_z(self, z):
+        return self._loglike_x(self._x_of_z(z))
+
+    def _potential_z(self, z):
+        lp = self._logprior_z(z) + self._loglike_z(z)
+        return jnp.where(jnp.isnan(lp), jnp.inf, -lp)
+
+    # Methods kept for back-compatibility (these take numpy arrays with the free parameters, in physical units):
+    def loglike(self, theta, ndim=None, nparams=None):
+        return float(self._loglike_x_jit(jnp.asarray(theta, dtype=float)))
+
+    def logprior(self, theta):
+        return float(self._logprior_x_jit(jnp.asarray(theta, dtype=float)))
+
     def logprob(self, theta):
         lp = self.logprior(theta) + self.loglike(theta)
-        if np.isnan(lp):
-            return -np.inf
-        else:
-            return lp
+        return -np.inf if np.isnan(lp) else lp
 
-    def __init__(self, data, sampler = 'multinest', n_live_points = 500, nwalkers = 100, nsteps = 300, nburnin = 500, emcee_factor = 1e-4, \
+    def _sample_prior(self, key, n):
+        keys = jax.random.split(key, len(self.prior_dists))
+        return jnp.stack([d.sample(keys[i], (n,)) for i, d in enumerate(self.prior_dists)], axis=-1)
+
+    def _best_prior_draws(self, key, n):
+        # Initial positions for MCMCs if no starting point is given: the n prior draws with the highest posterior
+        # probability out of max(1000, 20 * n):
+        x = self._sample_prior(key, max(1000, 20 * n))
+        z = self._z_of_x(x)
+        lp = -jax.lax.map(jax.jit(self._potential_z), z, batch_size=self.batch_size)
+        return z[jnp.argsort(-lp)[:n]]
+
+    def __init__(self, data, sampler = 'nested', n_live_points = 500, nwalkers = 100, nsteps = 300, nburnin = 500, emcee_factor = 1e-4, \
                  ecclim = 1., pl = 0.0, pu = 1.0, ta = 2458460., nthreads = None, light_travel_delay = False, stellar_radius = None, \
                  kelp_refl_interpolation_knots = None, kelp_thm_interpolation_knots = None, kelp_filt_wav = None, kelp_filt_trans = None,\
                  stellar_teff = None, kelp_ntheta = 5, kelp_nphi = 75, use_ultranest = False, use_dynesty = False, dynamic = False,\
                  dynesty_bound = 'multi', dynesty_sample='rwalk', dynesty_nthreads = None, dynesty_n_effective = np.inf, dynesty_use_stop = True,\
-                 dynesty_use_pool = None, dynesty_save_states=False, dynesty_resume=False, **kwargs):
+                 dynesty_use_pool = None, dynesty_save_states=False, dynesty_resume=False, seed = None, **kwargs):
 
         # Define output results object:
         self.results = None
-
-        # Save sampler inputs in case users are still using old definitions
-        self.use_ultranest = use_ultranest
-        self.use_dynesty = use_dynesty
-        self.dynamic = dynamic
-        self.dynesty_bound = dynesty_bound
-        self.dynesty_sample = dynesty_sample
-        self.dynesty_nthreads = dynesty_nthreads
-        self.dynesty_n_effective = dynesty_n_effective
-        self.dynesty_use_stop = dynesty_use_stop
-        self.dynesty_use_pool = dynesty_use_pool
-        self.dynesty_save_states = dynesty_save_states
-        self.dynesty_resume = dynesty_resume
 
         # Now extract sampler options:
         self.sampler = sampler
@@ -1740,20 +1615,13 @@ class fit(object):
         self.emcee_factor = emcee_factor
         self.nburnin = nburnin
         self.nthreads = nthreads
+        self.seed = seed if seed is not None else np.random.randint(0, 2**31 - 1)
 
-        # For kelp models, we may not want to compute phase curve models for _all_ time points (because model computation can be expensive)
-        # Instead we can compute phase curve models on discrete grid of phases and then interpolate over the rest of the phases
-        # By default we don't do this, but there is an option to do this if the user want to do this.
-        # User simply needs to provide number of knots to turn this on (different parameters for reflection and thermla phase curves)
+        # Kelp options (see juliet.model):
         self.kelp_refl_interpolation_knots = kelp_refl_interpolation_knots
         self.kelp_thm_interpolation_knots = kelp_thm_interpolation_knots
-
-        # Kelp emission phase curve also needs a transmission function...
-        ## These need to be dicts; with keys corresponding to instrument names
         self.kelp_filt_wav = kelp_filt_wav
         self.kelp_filt_trans = kelp_filt_trans
-
-        # ... and stellar effective temperatures and number of grid points along latitude (theta) and longitude (phi)
         self.stellar_teff = stellar_teff
         self.kelp_ntheta = kelp_ntheta
         self.kelp_nphi = kelp_nphi
@@ -1763,57 +1631,20 @@ class fit(object):
         if self.light_travel_delay and (stellar_radius is None):
 
             raise Exception('Error: if light_travel_delay is activated, a stellar radius needs to be given as well via stellar_radius = yourvalue; e.g., dataset.fit(..., light_travel_delay = True, stellar_radius = 1.1234).')
-        
+
         self.stellar_radius = stellar_radius
 
-        # Update sampler inputs in case user still using deprecated inputs. We'll remove this in some future. First, define standard pre-fix and sufix for the warnings:
-        ws1 = 'WARNING: use of the '
-        ws2 = ' argument is deprecated and will be removed in future juliet versions. Use the '
-        ws3 = ' instead; for more information, check the API of juliet.fit: https://juliet.readthedocs.io/en/latest/user/api.html#juliet.fit'
-        if self.use_ultranest:
-            self.sampler = 'ultranest'
-            print(ws1 + 'use_ultranest' + ws2 + '"sampler" string' + ws3)
-        if self.use_dynesty:
-            print(ws1 + 'use_dynesty' + ws2 + '"sampler" string' + ws3)
-            self.sampler = 'dynesty'
-            if self.dynamic:
-                self.sampler = 'dynamic_dynesty'
-                print(ws1 + 'dynamic' + ws2 + '"sampler" string' + ws3)
-            # Add the other deprecated flags to the kwargs:
-            if self.dynesty_bound != 'multi':
-                print(ws1 + 'dynesty_bound' + ws2 + '"bound" argument' + ws3)
-                # kwargs take presedence:
-                if 'bound' not in kwargs.keys():
-                    kwargs['bound'] = self.dynesty_bound
-            if self.dynesty_sample != 'rwalk':
-                print(ws1 + 'dynesty_sample' + ws2 + '"sample" argument' + ws3)
-                # kwargs take presedence:
-                if 'sample' not in kwargs.keys():
-                    kwargs['sample'] = self.dynesty_sample
-            if self.dynesty_nthreads is not None:
-                print(ws1 + 'dynesty_nthreads' + ws2 + '"nthreads" argument' +
-                      ws3)
-                # The nthreads argument takes presedence now:
-                if nthreads is None:
-                    self.nthreads = self.dynesty_nthreads
-            if self.dynesty_n_effective is not np.inf:
-                print(ws1 + 'dynesty_n_effective' + ws2 +
-                      '"n_effective" argument' + ws3)
-                # kwargs take presedence:
-                if 'n_effective' not in kwargs.keys():
-                    kwargs['n_effective'] = self.dynesty_n_effective
-            if not self.dynesty_use_stop:
-                print(ws1 + 'dynesty_use_stop' + ws2 + '"use_stop" argument' +
-                      ws3)
-                # kwargs take presedence:
-                if 'use_stop' not in kwargs.keys():
-                    kwargs['use_stop'] = self.dynesty_use_stop
-            if self.dynesty_use_pool is not None:
-                print(ws1 + 'dynesty_use_pool' + ws2 + '"use_pool" argument' +
-                      ws3)
-                # kwargs take presedence:
-                if 'use_pool' not in kwargs.keys():
-                    kwargs['use_pool'] = self.dynesty_use_pool
+        # Deprecated sampler flags; all nested samplers of previous versions are now the JAX nested sampler:
+        if use_ultranest or use_dynesty:
+            print('WARNING: use_ultranest and use_dynesty are deprecated; using the JAX nested sampler (sampler = "nested").')
+            self.sampler = 'nested'
+        if self.sampler in legacy_nested_samplers:
+            print('Note: juliet now runs on JAX; sampler "' + self.sampler + '" is replaced by the JAX nested sampler (sampler = "nested").')
+            self.sampler = 'nested'
+        if self.sampler not in nested_samplers + mcmc_samplers:
+            raise Exception('INPUT ERROR: sampler "' + self.sampler + '" not recognized. Options are: ' + ', '.join(nested_samplers + mcmc_samplers) + '.')
+        if self.nthreads is not None:
+            print('Note: nthreads has no effect in the JAX backend (likelihood evaluations are vectorized instead).')
 
         # Define (exo-)algorithmic options:
         self.ecclim = ecclim
@@ -1826,68 +1657,38 @@ class fit(object):
 
         # Inhert the output folder:
         self.out_folder = data.out_folder
-        self.transformed_priors = np.zeros(self.data.nparams)
 
         # Inhert extra likelihood:
         self.extra_loglikelihood = data.extra_loglikelihood
         self.extra_loglikelihood_boolean = data.extra_loglikelihood_boolean
 
-        # Define prefixes in case saving is turned on (i.e., user passed an out_folder). PyMultiNest and dynesty ones are set by hand. For the rest, use the new
-        # sampler string directly:
-        if self.sampler == 'multinest':
-            self.sampler_prefix = ''
-        elif self.sampler == 'dynesty':
-            self.sampler_prefix = '_dynesty_NS_'
-        elif self.sampler == 'dynamic_dynesty':
-            self.sampler_prefix = '_dynesty_DNS_'
-        else:
-            self.sampler_prefix = self.sampler + '_'
-
-        # Before starting, check if force_dynesty or force_pymultinest is on; change options accordingly:
-        if force_dynesty and (self.sampler == 'multinest'):
-            print(
-                'PyMultinest installation not detected. Forcing dynesty as the sampler.'
-            )
-            self.sampler = 'dynesty'
-            self.sampler_prefix = '_dynesty_NS_'
-          
-        if force_pymultinest and (self.sampler == 'dynesty'):
-            print(
-                'dynesty installation not detected. Forcing PyMultinest as the sampler.'
-            )
-            
-            self.sampler = 'multinest'
-            self.sampler_prefix = ''
+        # Prefix of the output files:
+        self.sampler_prefix = self.sampler + '_'
 
         # Generate a posteriors self that will save the current values of each of the parameters. Initialization value is unimportant for nested samplers;
         # if MCMC, this saves the initial parameter values:
         self.posteriors = {}
         self.model_parameters = list(self.data.priors.keys())
         self.paramnames = []
+        self.fixed_values = {}
+        self.prior_dists = []
         for pname in self.model_parameters:
 
-            if self.data.priors[pname]['distribution'] == 'fixed':
-                self.posteriors[pname] = self.data.priors[pname][
-                    'hyperparameters']
+            if self.data.priors[pname]['distribution'].lower() == 'fixed':
+                self.posteriors[pname] = self.data.priors[pname]['hyperparameters']
+                self.fixed_values[pname] = float(self.data.priors[pname]['hyperparameters'])
 
             else:
-                if self.sampler in mcmc_samplers:
+                if self.sampler in mcmc_samplers and self.data.starting_point is not None:
                     self.posteriors[pname] = self.data.starting_point[pname]
                 else:
-                    self.posteriors[
-                        pname] = 0.  #self.data.priors[pname]['cvalue']
+                    self.posteriors[pname] = 0.
                 self.paramnames.append(pname)
-        # For each of the variables in the prior that is not fixed, define an internal dictionary that will save the
-        # corresponding transformation function to the prior corresponding to that variable. Idea is that with this one
-        # simply does self.transform_prior[variable_name](value) and you get the transformed value to the 0,1 prior.
-        # This avoids having to keep track of the prior distribution on each of the iterations. This is only useful for
-        # nested samplers:
-        if self.sampler not in mcmc_samplers:
-            self.transform_prior = {}
-            self.set_prior_transform()
-        else:
-            self.evaluate_logprior = {}
-            self.set_logpriors()
+                self.prior_dists.append(jm.prior_distribution(self.data.priors[pname]['distribution'],
+                                                              self.data.priors[pname]['hyperparameters']))
+
+        self.transforms = [biject_to(d.support) for d in self.prior_dists]
+        self.nparams = len(self.paramnames)
 
         # Generate light-curve and radial-velocity models:
         if self.data.t_lc is not None:
@@ -1914,6 +1715,26 @@ class fit(object):
                             ta=self.ta,
                             log_like_calc=True)
 
+        # Number of likelihood evaluations vectorized at once when samplers evaluate many points (bounds the memory used
+        # for large datasets; see model.batch_size):
+        self.batch_size = kwargs.get('batch_size', min(m.batch_size for m in [getattr(self, 'lc', None), getattr(self, 'rv', None)]
+                                                       if m is not None))
+
+        # Extra log-likelihood (functions not written with jax.numpy are evaluated on the host via callbacks):
+        uses_callbacks = any(m.uses_callbacks for m in [getattr(self, 'lc', None), getattr(self, 'rv', None)] if m is not None)
+        if self.extra_loglikelihood_boolean:
+            self._extra_loglikelihood_fn, is_callback = jm.jax_compatible(self.extra_loglikelihood['loglikelihood'],
+                                                                          jm.example_parameter_values(self.data.priors),
+                                                                          'extra_loglikelihood')
+            uses_callbacks = uses_callbacks or is_callback
+        if uses_callbacks and self.sampler == 'nuts':
+            raise Exception('sampler = "nuts" needs gradients of the likelihood, so non_linear_functions and extra_loglikelihood '
+                            'must be written with jax.numpy (or use the nested, emcee or zeus samplers).')
+
+        # jit-compiled log-likelihood and log-prior of the free parameters (in physical units):
+        self._loglike_x_jit = jax.jit(self._loglike_x)
+        self._logprior_x_jit = jax.jit(self._logprior_x)
+
         # First, check if a run has already been performed with the user-defined sampler. If it hasn't, run it.
         # If it has (detected through its output filename), skip running again and jump straight to loading the
         # data:
@@ -1927,370 +1748,145 @@ class fit(object):
 
         # If runSampler is True, then run the sampler of choice:
         if runSampler:
-            if 'ultranest' in self.sampler:
-                from ultranest import ReactiveNestedSampler
 
-                # Match kwargs to possible ReactiveNestedSampler keywords. First, extract possible arguments of ReactiveNestedSampler:
-                args = ReactiveNestedSampler.__init__.__code__.co_varnames
-                rns_args = {}
-                # First, define some standard ones:
-                rns_args['transform'] = self.prior_transform_r
-                rns_args['log_dir'] = self.out_folder
-                rns_args['resume'] = True
-                # Now extract arguments from kwargs; they take presedence over the standard ones above:
-                for arg in args:
-                    if arg in kwargs:
-                        rns_args[arg] = kwargs[arg]
-                # ...and load the sampler:
-                sampler = ReactiveNestedSampler(self.paramnames, self.loglike,
-                                                **rns_args)
+            rng_key = jax.random.PRNGKey(self.seed)
+            rng_key, init_key, run_key = jax.random.split(rng_key, 3)
 
-                if 'slicesampler' in self.sampler:
-                    import ultranest.stepsampler
+            if self.sampler == 'nested':
 
-                    # Match kwarfs to possible args in RegionSliceSampler:
-                    args = ultranest.stepsampler.SliceSampler.__init__.__code__.co_varnames
-                    rss_args = {}
-                    # First, define standard ones:
-                    rss_args['nsteps'] = 400
-                    rss_args['adaptive_nsteps'] = 'move-distance'
-                    # Extract kwargs, add them in:
-                    for arg in args:
-                        if arg in kwargs:
-                            rss_args[arg] = kwargs[arg]
+                num_delete = kwargs.get('num_delete', max(1, self.n_live_points // 2))
+                num_inner_steps = kwargs.get('num_inner_steps', max(5, 2 * self.nparams))
+                if self.data.verbose:
+                    print('\t Running nested sampling with {0:} live points, {1:} deleted per iteration and {2:} slice steps per new point.'.format(
+                          self.n_live_points, num_delete, num_inner_steps))
+                initial_z = self._z_of_x(self._sample_prior(init_key, self.n_live_points))
 
-                    # Apply stepsampler:
-                    sampler.stepsampler = ultranest.stepsampler.RegionSliceSampler(
-                        **rss_args)
+                ns = run_nested(jax.jit(self._logprior_z), chunked_vmap(jax.jit(self._loglike_z), self.batch_size), initial_z, run_key,
+                                num_delete=num_delete, num_inner_steps=num_inner_steps,
+                                dlogz=kwargs.get('dlogz', 0.1),
+                                max_iterations=kwargs.get('max_iterations', 1000000),
+                                n_posterior_samples=kwargs.get('n_posterior_samples', None),
+                                verbose=self.data.verbose)
 
-                # Now do the same for ReactiveNestedSampler.run --- load any kwargs the user has given as input:
-                args = ReactiveNestedSampler.run.__code__.co_varnames
-                rns_run_args = {}
-                # Define some standard ones:
-                rns_run_args['frac_remain'] = 0.1
-                rns_run_args['min_num_live_points'] = self.n_live_points
-                rns_run_args['max_num_improvement_loops'] = 1
-                # Load the ones from the kwargs:
-                for arg in args:
-                    if arg in kwargs:
-                        rns_run_args[arg] = kwargs[arg]
-                # Run the sampler:
-                results = sampler.run(**rns_run_args)
-                sampler.print_results()
-                sampler.plot()
+                x_of_z = jax.jit(jax.vmap(self._x_of_z))
+                posterior_samples = np.asarray(x_of_z(ns['posterior_samples']))
 
-                # Save ultranest outputs:
-                out['ultranest_output'] = results
-                # Get weighted posterior:
-                posterior_samples = results['samples']
-                # Get lnZ:
-                out['lnZ'] = results['logz']
-                out['lnZerr'] = results['logzerr']
+                # Save nested sampling outputs (dead points, in physical units):
+                out['nested_output'] = {'samples': np.asarray(x_of_z(ns['samples'])),
+                                        'loglikelihood': ns['loglikelihood'],
+                                        'logwt': ns['logwt'],
+                                        'ess': ns['ess'],
+                                        'niterations': ns['niterations']}
+                out['lnZ'] = ns['logz']
+                out['lnZerr'] = ns['logzerr']
 
-            elif 'multinest' in self.sampler:
-                # As done for ultranest above, scan possible arguments for pymultinest.run:
-                args = pymultinest.run.__code__.co_varnames
-                mn_args = {}
-                # Define some standard ones:
-                mn_args['n_live_points'] = self.n_live_points
-                mn_args['max_modes'] = 100
-                mn_args['outputfiles_basename'] = self.out_folder + 'jomnest_'
-                mn_args['resume'] = False
-                mn_args['verbose'] = self.data.verbose
-                # Now extract arguments from kwargs:
-                for arg in args:
-                    if arg in kwargs:
-                        mn_args[arg] = kwargs[arg]
-                # Define the sampler:
-                pymultinest.run(self.loglike, self.prior_transform,
-                                self.data.nparams, **mn_args)
+            elif self.sampler == 'nautilus':
 
-                # Now, with the sampler defined, repeat the same as above for the pymultinest.Analyzer object:
-                args = pymultinest.Analyzer.__init__.__code__.co_varnames
-                mna_args = {}
-                # Define standard ones:
-                mna_args['outputfiles_basename'] = self.out_folder + 'jomnest_'
-                mna_args['n_params'] = self.data.nparams
-                # Load the ones from kwargs:
-                for arg in args:
-                    if arg in kwargs:
-                        mna_args[arg] = kwargs[arg]
-                # Run and get output:
-                output = pymultinest.Analyzer(**mna_args)
-                # Get out parameters: this matrix has (samples,n_params+1):
-                posterior_samples = output.get_equal_weighted_posterior(
-                )[:, :-1]
-                # Get INS lnZ:
-                out['lnZ'] = output.get_stats()['global evidence']
-                out['lnZerr'] = output.get_stats()['global evidence error']
+                import nautilus
+                # Prior transform of the unit hypercube (vectorized, with the same transforms as juliet's original nested samplers):
+                transforms = {'uniform': transform_uniform, 'normal': transform_normal, 'truncatednormal': transform_truncated_normal,
+                              'jeffreys': transform_loguniform, 'loguniform': transform_loguniform, 'beta': transform_beta,
+                              'exponential': transform_exponential, 'modjeffreys': transform_modifiedjeffreys}
+                prior_transforms = [(transforms[self.data.priors[p]['distribution'].lower()], self.data.priors[p]['hyperparameters'])
+                                    for p in self.paramnames]
 
-            elif 'dynesty' in self.sampler:
+                def prior(u):
+                    x = np.empty_like(u)
+                    for i, (transform, hyperparameters) in enumerate(prior_transforms):
+                        x[:, i] = transform(u[:, i], hyperparameters)
+                    return x
 
-                if self.sampler == 'dynamic_dynesty':
+                batched_loglike = jax.jit(jax.vmap(chunked_vmap(self._loglike_x_jit, self.batch_size)))
 
-                    DynestySampler = dynesty.DynamicNestedSampler
+                def likelihood(x):
+                    log_like = np.asarray(batched_loglike(jnp.asarray(x)))
+                    return np.where(np.isfinite(log_like), log_like, -1e300)
 
-                elif self.sampler == 'dynesty':
+                sampler_kwargs = dict(n_live=self.n_live_points, n_batch=kwargs.get('n_batch', 1000), seed=int(self.seed))
+                sampler_kwargs.update(_matching_kwargs(nautilus.Sampler.__init__, kwargs))
+                for k in ['prior', 'likelihood', 'n_dim', 'vectorized', 'pass_dict']:
+                    sampler_kwargs.pop(k, None)
+                run_kwargs = dict(verbose=self.data.verbose, discard_exploration=True)
+                run_kwargs.update(_matching_kwargs(nautilus.Sampler.run, kwargs))
+                ns = nautilus.Sampler(prior, likelihood, n_dim=self.nparams, vectorized=True, pass_dict=False, **sampler_kwargs)
+                ns.run(**run_kwargs)
+                points, log_w, log_l = ns.posterior()
+                posterior_samples = np.asarray(ns.posterior(equal_weight=True)[0])
+                out['nautilus_output'] = {'samples': points, 'logwt': log_w, 'loglikelihood': log_l, 'ess': ns.n_eff}
+                out['lnZ'] = float(ns.log_z)
+                out['lnZerr'] = float(1. / np.sqrt(ns.n_eff))
 
-                    DynestySampler = dynesty.NestedSampler
+            else:
 
-                # To run dynesty, we do it a little bit different depending if we are doing multithreading or not:
-                if self.nthreads is None:
+                from numpyro.infer import MCMC
+                mcmc_kwargs = _matching_kwargs(MCMC.__init__, kwargs)
+                for k in ['num_warmup', 'num_samples', 'num_chains', 'chain_method']:
+                    mcmc_kwargs.pop(k, None)
 
-                    # As with the other samplers, first extract list of possible args (try-except for back-compatibility with prior dynesty versions):
-                    try:
+                if self.sampler == 'nuts':
 
-                        args = vars(DynestySampler)['__init__'].__code__.co_varnames
+                    from numpyro.infer import NUTS
+                    # Posterior widths of juliet parameters span many orders of magnitude (e.g., t0 vs. sigma_w), so by default
+                    # adapt a dense mass matrix without numpyro's regularization (which shrinks variances towards 1e-3):
+                    kernel_kwargs = {'dense_mass': True, 'regularize_mass_matrix': False}
+                    kernel_kwargs.update(_matching_kwargs(NUTS.__init__, kwargs))
+                    kernel_kwargs.pop('potential_fn', None)
+                    nchains = kwargs.get('num_chains', 4)
+                    kernel_name = 'nuts'
 
-                    except:
+                else:
 
-                        args = vars(DynestySampler).keys()
+                    from numpyro.infer import AIES, ESS
+                    kernel_class = AIES if self.sampler == 'emcee' else ESS
+                    # Don't shuffle walkers between iterations (numpyro's default for ESS), so posteriors_per_walker
+                    # holds the actual trajectory of each walker:
+                    kernel_kwargs = {'randomize_split': False}
+                    kernel_kwargs.update(_matching_kwargs(kernel_class.__init__, kwargs))
+                    kernel_kwargs.pop('potential_fn', None)
+                    nchains = self.nwalkers
+                    kernel_name = 'aies' if self.sampler == 'emcee' else 'ess'
 
-                    d_args = {}
-
-                    # Define some standard ones (for back-compatibility with previous juliet versions):
-                    d_args['bound'] = 'multi'
-                    d_args['sample'] = 'rwalk'
-                    d_args['nlive'] = self.n_live_points
-
-                    # Match them with kwargs (kwargs take preference):
-                    for arg in args:
-                        if arg in kwargs:
-                            d_args[arg] = kwargs[arg]
-
-                    # Define the sampler:
-                    ### NOTE: In case we are resuming a dynesty run, we need to restore from checkpoint file:
-                    if not self.dynesty_resume:
-                        sampler = DynestySampler(self.loglike,
-                                                self.prior_transform_r,
-                                                self.data.nparams, **d_args)
+                # Initial positions:
+                if self.data.starting_point is not None:
+                    initial_position = np.array([self.data.starting_point[pname] for pname in self.paramnames], dtype=float)
+                    if self.sampler == 'nuts':
+                        initial_x = initial_position + np.zeros((nchains, self.nparams))
                     else:
-                        sampler = DynestySampler.restore(self.out_folder + self.sampler_prefix + '_checkpoint.pkl')
-
-                    # Now do the same for the actual sampler:
-                    try:
-
-                        args = sampler.run_nested.__func__.__code__.co_varnames
-
-                    except:
-
-                        args = vars(sampler).keys()
-
-                    ds_args = {}
-
-                    # Load ones from kwargs:
-                    for arg in args:
-                        if arg in kwargs:
-                            ds_args[arg] = kwargs[arg]
-
-                    ### NOTE: If the user wants to save and resume dynesty runs, they need to provide one additional keyword to juliet.fit: checkpoint_every 
-                    ### (sampler state will be saved every checkpoint_every seconds); we will automatically save the checkpoint file in the output directory location
-                    ### See, #127 for more details.
-                    if self.dynesty_save_states:
-                        ds_args['checkpoint_file'] = self.out_folder + self.sampler_prefix + '_checkpoint.pkl'
-
-                    # Now run:
-                    sampler.run_nested(**ds_args)
-
-                    # And extract results
-                    results = sampler.results
-
+                        # Perturb initial position for each of the walkers:
+                        initial_x = initial_position + self.emcee_factor * np.asarray(
+                                    jax.random.normal(init_key, (nchains, self.nparams)))
+                    initial_z = self._z_of_x(jnp.asarray(initial_x))
                 else:
+                    if self.data.verbose:
+                        print('\t No starting_point given; initializing chains at the best of a set of prior draws.')
+                    initial_z = self._best_prior_draws(init_key, nchains)
 
-                    # Before running the whole multithread magic, match kwargs with functional arguments (try-except 
-                    # for back-compatibility with prior dynesty versions):
-                    try: 
+                # (ensemble samplers vmap the potential over walkers: evaluate it in memory-bounded chunks)
+                potential = jax.jit(self._potential_z) if self.sampler == 'nuts' else chunked_vmap(jax.jit(self._potential_z), self.batch_size)
+                samples_z, _ = run_numpyro(kernel_name, potential, initial_z, run_key,
+                                           num_warmup=self.nburnin, num_samples=self.nsteps, num_chains=nchains,
+                                           kernel_kwargs=kernel_kwargs, mcmc_kwargs=mcmc_kwargs)
 
-                        args = vars(DynestySampler)['__init__'].__code__.co_varnames
+                x_of_z = jax.jit(jax.vmap(jax.vmap(self._x_of_z)))
+                chains = np.asarray(x_of_z(jnp.asarray(samples_z)))
 
-                    except:
-
-                        args = vars(DynestySampler).keys()
-
-                    d_args = {}
-
-                    # Define some standard ones (for back-compatibility with previous juliet versions):
-                    d_args['bound'] = 'multi'
-                    d_args['sample'] = 'rwalk'
-                    d_args['nlive'] = self.n_live_points
-
-                    # Match them with kwargs:
-                    for arg in args:
-                        if arg in kwargs:
-                            d_args[arg] = kwargs[arg]
-
-                    # Now define a mock sampler to retrieve variable names:
-                    mock_sampler = DynestySampler(self.loglike,
-                                                  self.prior_transform_r,
-                                                  self.data.nparams, **d_args)
-                    # Extract args:
-                    try:
-
-                        args = mock_sampler.run_nested.__func__.__code__.co_varnames
-
-                    except:
-
-                        args = vars(mock_sampler).keys()
-
-                    ds_args = {}
-
-                    # Load ones from kwargs:
-                    for arg in args:
-                        if arg in kwargs:
-                            ds_args[arg] = kwargs[arg]
-                    
-                    ### NOTE: If the user wants to save and resume dynesty runs, they need to provide one additional keyword to juliet.fit: checkpoint_every 
-                    ### (sampler state will be saved every checkpoint_every seconds); we will automatically save the checkpoint file in the output directory location
-                    ### See, #127 for more details.
-                    if self.dynesty_save_states:
-                        ds_args['checkpoint_file'] = self.out_folder + self.sampler_prefix + '_checkpoint.pkl'
-
-                    # Now run all with multiprocessing:
-                    """
-                    with contextlib.closing(Pool(processes=self.nthreads -
-                                                 1)) as executor:
-                        sampler = DynestySampler(self.loglike,
-                                                 self.prior_transform_r,
-                                                 self.data.nparams,
-                                                 pool=executor,
-                                                 queue_size=self.nthreads,
-                                                 **d_args)
-                        sampler.run_nested(**ds_args)
-                        results = sampler.results
-
-                    """
-                    with mp.Pool(self.nthreads) as pool:
-
-                        ### NOTE: In case we are resuming a dynesty run, we need to restore from checkpoint file:
-                        if not self.dynesty_resume:
-                            sampler = DynestySampler(self.loglike,
-                                                    self.prior_transform_r,
-                                                    self.data.nparams,
-                                                    pool = pool, 
-                                                    queue_size=self.nthreads,
-                                                    **d_args)
-                        else:
-                            sampler = DynestySampler.restore(self.out_folder + self.sampler_prefix + '_checkpoint.pkl', pool=pool)
-
-                        sampler.run_nested(**ds_args)
-
-                    results = sampler.results 
-
-                # Extract dynesty outputs:
-                out['dynesty_output'] = results
-
-                # Get weighted posterior:
-                weights = np.exp(results['logwt'] - results['logz'][-1])
-                posterior_samples = resample_equal(results.samples, weights)
-
-                # Get lnZ:
-                out['lnZ'] = results.logz[-1]
-                out['lnZerr'] = results.logzerr[-1]
-
-            elif 'emcee' in self.sampler:
-                # Initiate starting point for each walker. To this end, first load starting values.
-                initial_position = np.array([])
-                for pname in self.model_parameters:
-
-                    if self.data.priors[pname]['distribution'] != 'fixed':
-
-                        initial_position = np.append(initial_position,
-                                                     self.posteriors[pname])
-
-                # Perturb initial position for each of the walkers:
-                pos = initial_position + self.emcee_factor * np.random.randn(
-                    self.nwalkers, len(initial_position))
-
-                # Before performing the sampling, catch any kwargs that go to EnsembleSampler; rest of kwargs are assumed to go
-                # to run_mcmc:
-                args = emcee.EnsembleSampler.__init__.__code__.co_varnames
-                ES_args = {}
-                runmcmc_args = {}
-
-                # Match them with kwargs (kwargs take preference):
-                for arg in args:
-                    if arg in kwargs:
-                        ES_args[arg] = kwargs[arg]
-                        kwargs.pop(arg)
-
-                # Now perform the sampling. If nthreads is defined, parallelize. If not, go the serial way:
-                if self.nthreads is None:
-                    sampler = emcee.EnsembleSampler(self.nwalkers,
-                                                    self.data.nparams,
-                                                    self.logprob, **ES_args)
-                    sampler.run_mcmc(pos, self.nsteps + self.nburnin, **kwargs)
-                else:
-                    with contextlib.closing(Pool(processes=self.nthreads -
-                                                 1)) as executor:
-                        sampler = emcee.EnsembleSampler(self.nwalkers,
-                                                        self.data.nparams,
-                                                        self.logprob,
-                                                        pool=executor,
-                                                        **ES_args)
-                        sampler.run_mcmc(pos, self.nsteps + self.nburnin,
-                                         **kwargs)
-
-                # Store posterior samples. First, store the samples for each walker:
-                out['posteriors_per_walker'] = sampler.get_chain()
+                # Store posterior samples. First, store the samples for each walker/chain (shape (steps, walkers, parameters), as emcee):
+                out['posteriors_per_walker'] = np.swapaxes(chains, 0, 1)
 
                 # And now store posteriors with all walkers flattened out:
-                posterior_samples = sampler.get_chain(discard=self.nburnin,
-                                                      flat=True)
+                posterior_samples = chains.reshape(-1, self.nparams)
 
-            elif 'zeus' in self.sampler:
-                # Identical implementation to emcee...?
-                # Initiate starting point for each walker. To this end, first load starting values.
-                initial_position = np.array([])
-                for pname in self.model_parameters:
-                    if self.data.priors[pname]['distribution'] != 'fixed':
-                        initial_position = np.append(initial_position, self.posteriors[pname])
-
-                # Perturb initial position for each of the walkers:
-                pos = initial_position + self.emcee_factor * np.random.randn(self.nwalkers, len(initial_position))
-
-                # Before performing the sampling, catch any kwargs that go to EnsembleSampler; rest of kwargs are assumed to go
-                # to run_mcmc:
-                args = zeus.EnsembleSampler.__init__.__code__.co_varnames
-                zeus_args = {}
-                runmcmc_args = {}
-
-                # Match them with kwargs (kwargs take preference):
-                for arg in args:
-                    if arg in kwargs:
-                        zeus_args[arg] = kwargs[arg]
-                        kwargs.pop(arg)
-
-                # Now perform the sampling. If nthreads is defined, parallelize. If not, go the serial way:
-                if self.nthreads is None:
-                    sampler = zeus.EnsembleSampler(self.nwalkers, self.data.nparams, self.logprob, **zeus_args)
-                    sampler.run_mcmc(pos, self.nsteps + self.nburnin, **kwargs)
-                else:
-                    with contextlib.closing(Pool(processes=self.nthreads-1)) as executor:
-                        sampler = zeus.EnsembleSampler(self.nwalkers, self.data.nparams, self.logprob, pool = executor, **zeus_args)
-                        sampler.run_mcmc(pos, self.nsteps + self.nburnin, **kwargs)
-
-                # Store posterior samples. First, store the samples for each walker:
-                out['posteriors_per_walker'] = sampler.get_chain()
-
-                # And now store posteriors with all walkers flattened out:
-
-                posterior_samples = sampler.get_chain(discard = self.nburnin, 
-                                                      flat = True)
-
-            # Save posterior samples as outputted by Multinest/Dynesty:
+            # Save posterior samples as outputted by the sampler:
             out['posterior_samples'] = {}
             out['posterior_samples']['unnamed'] = posterior_samples
 
             # Save log-likelihood of each of the samples:
-            out['posterior_samples']['loglike'] = np.zeros(
-                posterior_samples.shape[0])
-            for i in range(posterior_samples.shape[0]):
-                out['posterior_samples']['loglike'][i] = self.loglike(
-                    posterior_samples[i, :])
+            out['posterior_samples']['loglike'] = np.asarray(jax.lax.map(self._loglike_x_jit, jnp.asarray(posterior_samples),
+                                                                         batch_size=min(len(posterior_samples), self.batch_size)))
 
             pcounter = 0
             for pname in self.model_parameters:
-                if data.priors[pname]['distribution'] != 'fixed':
+                if data.priors[pname]['distribution'].lower() != 'fixed':
                     self.posteriors[pname] = np.median(
                         posterior_samples[:, pcounter])
                     out['posterior_samples'][
@@ -2337,29 +1933,13 @@ class fit(object):
             if Tparametrization:
                 for pnum in list(Tdict.keys()):
                     all_ns = np.array(list(Tdict[pnum].keys()))
-                    Nsamples = len(Tdict[pnum][all_ns[0]])
-                    out['posterior_samples'][
-                        'P_' + pnum], out['posterior_samples'][
-                            't0_' +
-                            pnum] = np.zeros(Nsamples), np.zeros(Nsamples)
+                    all_Ts = np.array([Tdict[pnum][n] for n in all_ns])
                     N = len(all_ns)
-                    for i in range(Nsamples):
-                        all_Ts = np.zeros(N)
-                        for j in range(len(all_ns)):
-                            all_Ts[j] = Tdict[pnum][all_ns[j]][i]
-                        XY, Y, X, X2 = np.sum(all_Ts * all_ns) / N, np.sum(
-                            all_Ts) / N, np.sum(all_ns) / N, np.sum(all_ns**
-                                                                    2) / N
-                        # Get slope:
-                        out['posterior_samples']['P_' +
-                                                 pnum][i] = (XY -
-                                                             X * Y) / (X2 -
-                                                                       (X**2))
-                        # Intercept:
-                        out['posterior_samples'][
-                            't0_' +
-                            pnum][i] = Y - out['posterior_samples']['P_' +
-                                                                    pnum][i] * X
+                    XY, Y, X, X2 = np.sum(all_Ts * all_ns[:, None], axis=0) / N, np.sum(all_Ts, axis=0) / N, \
+                                   np.sum(all_ns) / N, np.sum(all_ns**2) / N
+                    # Get slope and intercept:
+                    out['posterior_samples']['P_' + pnum] = (XY - X * Y) / (X2 - (X**2))
+                    out['posterior_samples']['t0_' + pnum] = Y - out['posterior_samples']['P_' + pnum] * X
             if self.data.t_lc is not None:
                 if True in self.data.lc_options['efficient_bp'].values():
                     out['pu'] = self.pu
@@ -2374,19 +1954,6 @@ class fit(object):
                 out,
                 open(self.out_folder + self.sampler_prefix + 'posteriors.pkl',
                      'wb'))
-            """
-            if 'dynesty' in self.sampler:
-                if (self.sampler == 'dynamic_dynesty') and (self.out_folder is not None):
-                    pickle.dump(out,open(self.out_folder+'_dynesty_DNS_posteriors.pkl','wb'))
-                elif (self.sampler == 'dynesty') and (self.out_folder is not None):
-                    pickle.dump(out,open(self.out_folder+'_dynesty_NS_posteriors.pkl','wb'))
-            elif 'multinest' in self.sampler:
-                if (self.sampler == 'multinest') and (self.out_folder is not None):
-                    pickle.dump(out,open(self.out_folder+'posteriors.pkl','wb'))
-            elif 'ultranest' in self.sampler:
-                if (self.sampler == 'ultranest') and (self.out_folder is not None):
-                    pickle.dump(out,open(self.out_folder+self.sampler_prefix+'posteriors.pkl','wb'))
-            """
         else:
             # If the sampler was already ran, then user really wants to extract outputs from previous fit:
             print('Detected ' + self.sampler +
@@ -2402,54 +1969,6 @@ class fit(object):
                     self.out_folder + self.sampler_prefix + 'posteriors.pkl',
                     'rb'),
                                   encoding=self.data.pickle_encoding)
-            """
-            if (self.use_dynesty) and (self.out_folder is not None):
-                if self.dynamic:
-                    if os.path.exists(self.out_folder +
-                                      '_dynesty_DNS_posteriors.pkl'):
-                        if self.data.verbose:
-                            print(
-                                'Detected (dynesty) Dynamic NS output files --- extracting...'
-                            )
-                        if self.data.pickle_encoding is None:
-                            out = pickle.load(
-                                open(
-                                    self.out_folder +
-                                    '_dynesty_DNS_posteriors.pkl', 'rb'))
-                        else:
-                            out = pickle.load(
-                                open(
-                                    self.out_folder +
-                                    '_dynesty_DNS_posteriors.pkl', 'rb'),
-                                encoding=self.data.pickle_encoding)
-                else:
-                    if os.path.exists(self.out_folder +
-                                      '_dynesty_NS_posteriors.pkl'):
-                        if self.data.verbose:
-                            print(
-                                'Detected (dynesty) NS output files --- extracting...'
-                            )
-                        if self.data.pickle_encoding is None:
-                            out = pickle.load(
-                                open(
-                                    self.out_folder +
-                                    '_dynesty_NS_posteriors.pkl', 'rb'))
-                        else:
-                            out = pickle.load(
-                                open(
-                                    self.out_folder +
-                                    '_dynesty_NS_posteriors.pkl', 'rb'),
-                                encoding=self.data.pickle_encoding)
-            elif self.out_folder is not None:
-                if self.data.verbose:
-                    print(
-                        'Detected (MultiNest) NS output files --- extracting...'
-                    )
-                if self.data.pickle_encoding is None:
-                    out = pickle.load(open(self.out_folder+'posteriors.pkl','rb'))
-                else:
-                    out = pickle.load(open(self.out_folder+'posteriors.pkl','rb'), encoding = self.data.pickle_encoding)
-            """
             if len(out.keys()) == 0:
                 print(
                     'Warning: no output generated or extracted. Check the fit options given to juliet.fit().'
@@ -2461,13 +1980,12 @@ class fit(object):
                 for pname in out['posterior_samples'].keys():
                     if 'sigma_w_rv' == pname[:10]:
                         instrument = pname.split('_')[-1]
-                        out_temp['sigma_w_' +
-                                 self.sigmaw_iname[instrument]] = out['posterior_samples'][pname]
+                        out_temp['sigma_w_' + instrument] = out['posterior_samples'][pname]
                 for pname in out_temp.keys():
                     out['posterior_samples'][pname] = out_temp[pname]
                 # Extract parameters:
                 for pname in self.posteriors.keys():
-                    if data.priors[pname]['distribution'] != 'fixed':
+                    if data.priors[pname]['distribution'].lower() != 'fixed':
                         self.posteriors[pname] = np.median(
                             out['posterior_samples'][pname])
                 posterior_samples = out['posterior_samples']['unnamed']
@@ -2494,11 +2012,30 @@ class fit(object):
             self.rv.set_posterior_samples(out['posterior_samples'])
 
 
+def _quantiles(samples, alpha=0.68):
+    """Vectorized version of juliet.utils.get_quantiles along the first axis of samples."""
+    ordered = np.sort(samples, axis=0)
+    nsamples = samples.shape[0]
+    # (capped so that the indices below stay within the array for small numbers of samples)
+    nsamples_at_each_side = min(int(nsamples * (alpha / 2.) + 1), nsamples // 2 - 2 if nsamples % 2 == 0 else (nsamples - 1) // 2)
+    if nsamples % 2 == 0:
+        med_idx_up = int(nsamples / 2.) + 1
+        med_idx_down = med_idx_up - 1
+        return (ordered[med_idx_up] + ordered[med_idx_down]) / 2., ordered[med_idx_up + nsamples_at_each_side], \
+               ordered[med_idx_down - nsamples_at_each_side]
+    med_idx = int(nsamples / 2.)
+    return ordered[med_idx], ordered[med_idx + nsamples_at_each_side], ordered[med_idx - nsamples_at_each_side]
+
+
 class model(object):
     """
     Given a juliet data object, this kernel generates either a lightcurve or a radial-velocity object. Example usage:
 
                >>> model = juliet.model(data, modeltype = 'lc')
+
+    Models are pure JAX functions of a dictionary of parameter values: lightcurves are computed with jaxoplanet
+    (Kepler solver plus polynomial limb-darkening for the linear and quadratic laws; other laws and catwoman-like
+    asymmetric transits are integrated numerically) and RVs with jaxoplanet's Keplerian system.
 
     :param data: (juliet.load object)
         An object containing all the information about the current dataset.
@@ -2523,148 +2060,477 @@ class model(object):
         Stellar radius in units of solar-radii to use for the light travel time corrections.
 
     :param log_like_calc: (optional, boolean)
-        If True, it is assumed the model is generated to generate likelihoods values, and thus this skips the saving/calculation of the individual
-        models per planet (i.e., ``self.model['p1']``, ``self.model['p2']``, etc. will not exist). Default is False.
+        Kept for back-compatibility; it has no effect.
 
     """
 
-    def generate_rv_model(self, parameter_values, evaluate_global_errors=True):
-        self.modelOK = True
-        # Before anything continues, check the periods are chronologically ordered (this is to avoid multiple modes due to
-        # periods "jumping" between planet numbering):
-        first_time = True
+    def __new__(cls, data, *args, **kwargs):
+        # Data loaded with backend = 'legacy' are handled by the legacy implementation:
+        if getattr(data, 'backend', 'jax') == 'legacy':
+            from .legacy.fit import model as legacy_class
+            return legacy_class(data, *args, **kwargs)
+        return super().__new__(cls)
+
+    ###########################################################################################
+    # Pure (JAX) model functions. ``pv`` is a dictionary with the values of all the parameters.
+    ###########################################################################################
+
+    def _ld_coefficients(self, pv, instrument):
+        ldlaw = self.dictionary[instrument]['ldlaw']
+        parametrization = self.dictionary[instrument]['ldparametrization']
+        if ldlaw == 'none':
+            return jnp.array([0.1, 0.3])
+        name = self.ld_iname[instrument]
+        if ldlaw == 'linear':
+            if parametrization == 'kipping2013':
+                return jnp.stack([pv['q1_' + name]])
+            return jnp.stack([pv['u1_' + name]])
+        if ldlaw == 'nonlinear':
+            return jnp.stack([pv['c' + str(k) + '_' + name] for k in range(1, 5)])
+        if parametrization == 'kipping2013':
+            coeff1, coeff2 = jm.reverse_ld_coeffs(ldlaw, pv['q1_' + name], pv['q2_' + name])
+        else:
+            coeff1, coeff2 = pv['u1_' + name], pv['u2_' + name]
+        return jnp.stack([coeff1, coeff2])
+
+    def _T_parametrization_ephemerides(self, pv):
+        # If TTV parametrization is 'T' for planet i, the period and t0 are the least-squares slope and intercept of the
+        # transit times of all instruments:
+        planet_t0, planet_P = {}, {}
         for i in self.numbering:
-            if first_time:
-                cP = parameter_values['P_p' + str(i)]
-                first_time = False
+            if self.Tparametrization.get(i, False):
+                all_Ts, all_ns = [], []
+                for instrument in self.all_inames:
+                    for transit_number in self.dictionary[instrument]['TTVs'][int(i)]['transit_number']:
+                        all_Ts.append(pv['T_p' + str(i) + '_' + instrument + '_' + str(transit_number)])
+                        all_ns.append(transit_number)
+                all_Ts, all_ns = jnp.stack(all_Ts), np.array(all_ns, dtype=float)
+                N = self.N_TTVs[i]
+                XY, Y, X, X2 = jnp.sum(all_Ts * all_ns) / N, jnp.sum(all_Ts) / N, np.sum(all_ns) / N, np.sum(all_ns**2) / N
+                planet_P[i] = (XY - X * Y) / (X2 - (X**2))
+                planet_t0[i] = Y - planet_P[i] * X
+        return planet_t0, planet_P
+
+    def _ecc_omega(self, pv, i):
+        """Eccentricity and omega (in radians) of planet i."""
+        si = str(i)
+        if self.dictionary['ecc_parametrization'][i] == 0:
+            return pv['ecc_p' + si], pv['omega_p' + si] * np.pi / 180.
+        elif self.dictionary['ecc_parametrization'][i] == 1:
+            ecosw, esinw = pv['ecosomega_p' + si], pv['esinomega_p' + si]
+            return jm.safe_sqrt(ecosw**2 + esinw**2), jnp.arctan2(esinw, ecosw)
+        secosw, sesinw = pv['secosomega_p' + si], pv['sesinomega_p' + si]
+        return secosw**2 + sesinw**2, jnp.arctan2(sesinw, secosw)
+
+    def _planet_lightcurve(self, pv, instrument, i, P, t0, t):
+        """Lightcurve of planet i for instrument at (TTV-shifted) times t; returns (flux, ok)."""
+        d = self.dictionary[instrument]
+        si = str(i)
+        pkey = 'p' + si
+
+        if self.dictionary['efficient_bp'][i]:
+            if not self.dictionary['fitrho']:
+                a = pv['a_p' + si]
             else:
-                if cP < parameter_values['P_p' + str(i)]:
-                    cP = parameter_values['P_p' + str(i)]
+                a = ((pv['rho'] * G * ((P * 24. * 3600.)**2)) / (3. * np.pi))**(1. / 3.)
+            r1, r2 = pv['r1_p' + si], pv['r2_p' + si]
+            sq = jm.safe_sqrt(r1 / self.Ar)
+            b = jnp.where(r1 > self.Ar, (1 + self.pl) * (1. + (r1 - 1.) / (1. - self.Ar)),
+                          (1. + self.pl) + sq * r2 * (self.pu - self.pl))
+            p = jnp.where(r1 > self.Ar, (1 - r2) * self.pl + r2 * self.pu,
+                          self.pu + (self.pl - self.pu) * sq * (1. - r2))
+        else:
+            if not self.dictionary['fitrho']:
+                a = pv['a_p' + si]
+            else:
+                a = ((pv['rho'] * G * ((P * 24. * 3600.)**2)) / (3. * np.pi))**(1. / 3.)
+            if not d['TransitFitCatwoman']:
+                b, p = pv['b_p' + si], pv['p_p' + si + self.p_iname[pkey][instrument]]
+            else:
+                # Planet made of two semicircles of radii p1 and p2 rotated by an angle phi (catwoman):
+                b = pv['b_p' + si]
+                p1 = pv['p1_p' + si + self.p1_iname[pkey][instrument]]
+                p2 = pv['p2_p' + si + self.p1_iname[pkey][instrument]]
+                phi = pv['phi_p' + si]
+                p = jnp.minimum(p1, p2)
+
+        ecc, omega = self._ecc_omega(pv, i)
+        ok = ecc <= self.ecclim
+        # Safe values so that invalid regions of parameter space don't produce NaNs (or NaN gradients):
+        ecc = jnp.where(ecc < 1., ecc, 0.)
+        sinw, cosw = jnp.sin(omega), jnp.cos(omega)
+        ecc_factor = (1. + ecc * sinw) / (1. - ecc**2)
+        cosi = (b / a) * ecc_factor
+        ok = ok & jnp.logical_not((b > 1. + p) | (cosi >= 1.))
+        cosi = jnp.where(cosi < 1., cosi, 0.)
+        sini = jnp.sqrt(1. - cosi**2)
+
+        if d['resampling']:
+            nresampling, etresampling = d['nresampling'], d['exptimeresampling']
+        else:
+            nresampling, etresampling = None, None
+
+        tp = jm.time_of_periastron(t0, P, ecc, omega)
+
+        if d['TransitFit'] or d['TranEclFit']:
+            tt = jm.supersample(t, nresampling, etresampling)
+            dd, zz, _, _ = jm.sky_position(tt, tp, P, a, ecc, sinw, cosw, sini, cosi)
+            if d['TransitFitCatwoman']:
+                X, Y, zz, direction = jm.sky_coordinates(tt, tp, P, a, ecc, sinw, cosw, sini, cosi)
+                transit_model = jm.semicircles_transit_flux(X, Y, zz, direction, p1, p2, phi * np.pi / 180., d['ldlaw'],
+                                                            self._ld_coefficients(pv, instrument))
+            elif d['ldlaw'] in jm.POLYNOMIAL_LD_LAWS:
+                transit_model = jm.transit_flux(dd, zz, p, self._ld_coefficients(pv, instrument))
+            else:
+                transit_model = jm.numerical_transit_flux(dd, zz, p, d['ldlaw'], self._ld_coefficients(pv, instrument))
+            transit_model = transit_model.mean(axis=1)
+            if d['TransitFit']:
+                return transit_model, ok
+
+        # Eclipse (with or without transit):
+        fpname = 'fp_p' + si + self.fp_iname[pkey].get(instrument, '')
+        # There is no fp prior for, e.g., Lambertian or kelp phase curves; use a dummy value:
+        fp = pv[fpname] if fpname in pv else 100e-6
+        if self.light_travel_delay:
+            # Self-consistently calculate time of secondary eclipse and light-travel corrected times:
+            t_secondary = jm.time_of_secondary(t0, P, ecc, omega)
+            tp_eclipse = tp
+            eclipse_t = jm.light_travel_corrected_times(t, t0, tp, P, a, ecc, sinw, cosw, sini, self.stellar_radius)
+        else:
+            t_secondary = pv['t_secondary_p' + si]
+            tp_eclipse = jm.time_of_periastron(t_secondary, P, ecc, omega, secondary=True)
+            eclipse_t = t
+        tt = jm.supersample(eclipse_t, nresampling, etresampling)
+        dd, zz, _, _ = jm.sky_position(tt, tp_eclipse, P, a, ecc, sinw, cosw, sini, cosi)
+        eclipse_model = jm.eclipse_flux(dd, zz, p, fp).mean(axis=1)
+
+        if d['EclipseFit']:
+            return eclipse_model, ok
+
+        # Combined transit + eclipse models. Assume by default any phase-curve variations are being modelled externally
+        # (by, e.g., systematics models). Note out-of-eclipse the eclipse model is 1 + fp --- with in-eclipse always being 1.
+        # Subtract fp then:
+        if not self.phase_curve[instrument]:
+            return transit_model * (eclipse_model - fp), ok
+
+        # Otherwise, add all the phase curve models (evaluated at the non-supersampled eclipse times):
+        phase_curve_model = jnp.zeros_like(eclipse_t)
+        # Orbital phases of the sinusoidal and kelp phase curves are measured from the time of transit implied by the
+        # secondary eclipse ephemeris (as in previous juliet versions, where batman set it from t_secondary), so they
+        # are aligned with the secondary eclipse:
+        t0_eclipse = jm.time_of_conjunction(t_secondary, P, ecc, omega)
+        if d['PhaseCurveFit']:
+            phase_offset = pv['phaseoffset_p' + si + self.phaseoffset_iname[pkey][instrument]]
+            phase_curve_model = phase_curve_model + jm.sinusoidal_phase_curve(eclipse_t, t0_eclipse, P, fp, phase_offset)
+        if d['CowanAgolPCFit']:
+            suffix = si + self.fp_iname[pkey][instrument]
+            phase_curve_model = phase_curve_model + jm.cowan_agol_phase_curve(eclipse_t, t_secondary, P, fp,
+                                    pv['C1_p' + suffix], pv['D1_p' + suffix], pv['C2_p' + suffix], pv['D2_p' + suffix])
+        if d['LambertPCFit']:
+            sinf, cosf = jm.true_anomaly(eclipse_t, tp_eclipse, P, ecc)
+            Ag_Lambert = pv['aglambert_p' + si + self.aglambert_iname[pkey][instrument]]
+            phase_curve_model = phase_curve_model + jm.lambertian_phase_curve(sinf, cosf, sinw, cosw, sini, ecc, p, a, Ag_Lambert)
+        if d['KelpHomoPCFit']:
+            suffix = si + self.kelphomo_iname[pkey][instrument]
+            phase_curve_model = phase_curve_model + kelp_homogeneous_refl_pc_model(times=eclipse_t, t0=t0_eclipse, per=P, ar=a, rprs=p,
+                                    g=pv['g_p' + suffix], single_scat_albedo=pv['singlescat_p' + suffix],
+                                    nknots=self.kelp_refl_interpolation_knots)
+        if d['KelpThmPCFit']:
+            suffix = si + self.kelpthm_iname[pkey][instrument]
+            phase_curve_model = phase_curve_model + kelp_thermal_pc_model(times=eclipse_t, t0=t0_eclipse, per=P, ar=a, rprs=p,
+                                    filter_wavelength=self.kelp_filt_wav[instrument],
+                                    filter_transmittance=self.kelp_filt_trans[instrument],
+                                    hotspot_offset=pv['hotspotoff_p' + suffix], c11=pv['cml11_p' + suffix],
+                                    fprime=pv['fprime_p' + suffix], alpha=pv['alpha_p' + suffix],
+                                    omega_drag=pv['wdrag_p' + suffix], Teff=self.stellar_teff,
+                                    ntheta=self.kelp_ntheta, nphi=self.kelp_nphi,
+                                    nknots=self.kelp_thm_interpolation_knots)
+        if d['KelpInhomoPCFit']:
+            suffix = si + self.kelpinhomo_iname[pkey][instrument]
+            if 'x1_p' + suffix in pv:
+                x1, x2 = pv['x1_p' + suffix], pv['x2_p' + suffix]
+            else:
+                # x1' = sin(x1), x2' = sin(x2) (Morris et al. 2024):
+                x1, x2 = jnp.rad2deg(jnp.arcsin(pv['x1prime_p' + suffix])), jnp.rad2deg(jnp.arcsin(pv['x2prime_p' + suffix]))
+            phase_curve_model = phase_curve_model + kelp_inhomogeneous_refl_pc_model(times=eclipse_t, t0=t0_eclipse, per=P, ar=a, rprs=p,
+                                    w0=pv['w0_p' + suffix], wp=pv['wp_p' + suffix], Ag=pv['agkelp_p' + suffix], x1=x1, x2=x2,
+                                    nknots=self.kelp_refl_interpolation_knots)
+
+        # Multiply the phase curve with the normalized occultation model:
+        phase_curve_model = 1. + phase_curve_model * ((eclipse_model - 1.) / fp)
+        return transit_model * phase_curve_model, ok
+
+    def _lc_instrument_model(self, pv, instrument, t, lm_arguments=None, include_lm=True, at_data_times=True):
+        """Lightcurve model of an instrument at times t. Returns a dictionary with the model components and an 'ok' flag."""
+        d = self.dictionary[instrument]
+        out = {}
+        ok = jnp.array(True)
+        M = jnp.ones_like(t)
+
+        if d['TransitFit'] or d['EclipseFit'] or d['TranEclFit']:
+
+            if self.Tflag:
+                planet_t0, planet_P = self._T_parametrization_ephemerides(pv)
+
+            cP, ct0, ctimes = {}, {}, {}
+            for i in self.numbering:
+                ttv = d['TTVs'][i]
+                dummy_time = t
+                if not ttv['status']:
+                    P, t0 = pv['P_p' + str(i)], pv['t0_p' + str(i)]
+                elif ttv['parametrization'] == 'dt':
+                    # If, e.g., dt_p1_TESS1_-2, then n = -2 and the time of transit (with TTV) = t0 + n*P + dt_p1_TESS1_-2. This
+                    # implicitly sets maximum transit duration to P/2 days:
+                    P, t0 = pv['P_p' + str(i)], pv['t0_p' + str(i)]
+                    for transit_number in ttv['transit_number']:
+                        dt = pv['dt_p' + str(i) + '_' + instrument + '_' + str(transit_number)]
+                        transit_time = t0 + transit_number * P + dt
+                        dummy_time = jnp.where(jnp.abs(t - transit_time) < P / 4., t - dt, dummy_time)
                 else:
-                    self.modelOK = False
-                    return False
+                    t0, P = planet_t0[i], planet_P[i]
+                    for transit_number in ttv['transit_number']:
+                        transit_time = pv['T_p' + str(i) + '_' + instrument + '_' + str(transit_number)]
+                        dt = transit_time - (t0 + transit_number * P)
+                        dummy_time = jnp.where(jnp.abs(t - transit_time) < P / 4., t - dt, dummy_time)
+                cP[i], ct0[i], ctimes[i] = P, t0, dummy_time
 
-        # First, extract orbital parameters and save them, which will be common to all instruments:
-        for n in range(self.nplanets):
-            i = self.numbering[n]
+            # Check the periods are chronologically ordered (this is to avoid multiple modes due to periods "jumping" between
+            # planet numbering):
+            for i, j in zip(self.numbering[:-1], self.numbering[1:]):
+                ok = ok & (cP[i] < cP[j])
 
-            # Semi-amplitudes, t0 and P:
-            K, t0, P = parameter_values['K_p' + str(i)], parameter_values[
-                't0_p' + str(i)], parameter_values['P_p' + str(i)]
+            for i in self.numbering:
+                flux, planet_ok = self._planet_lightcurve(pv, instrument, i, cP[i], ct0[i], ctimes[i])
+                ok = ok & planet_ok
+                out['p' + str(i)] = flux
+                M = M + flux - 1.
 
-            # Extract eccentricity and omega depending on the used parametrization for each planet:
-            if self.dictionary['ecc_parametrization'][i] == 0:
-                ecc, omega = parameter_values[
-                    'ecc_p' +
-                    str(i)], parameter_values['omega_p' + str(i)] * np.pi / 180.
-            elif self.dictionary['ecc_parametrization'][i] == 1:
-                ecc = np.sqrt(parameter_values['ecosomega_p' + str(i)]**2 +
-                              parameter_values['esinomega_p' + str(i)]**2)
-                omega = np.arctan2(parameter_values['esinomega_p' + str(i)],
-                                   parameter_values['ecosomega_p' + str(i)])
+        # Convert the lightcurve so it complies with the juliet model accounting for the dilution and the mean out-of-transit flux:
+        D, Mflux = pv['mdilution_' + self.mdilution_iname[instrument]], pv['mflux_' + self.mflux_iname[instrument]]
+        M = (M * D + (1. - D)) * (1. / (1. + D * Mflux))
+        out['M'] = M
+
+        deterministic = M
+        if include_lm and self.lm_boolean[instrument]:
+            out['LM'] = self._linear_model(pv, instrument, lm_arguments)
+            deterministic = deterministic + out['LM']
+
+        if self.nlm_boolean[instrument]:
+            if not at_data_times:
+                raise Exception('Non-linear functions can only be evaluated at the times of the data.')
+            out['NLM'] = self.nlm_functions[instrument](pv)
+            if self.multiplicative_non_linear_function[instrument]:
+                deterministic = deterministic * out['NLM']
             else:
-                ecc = parameter_values['secosomega_p' + str(
-                    i)]**2 + parameter_values['sesinomega_p' + str(i)]**2
-                omega = np.arctan2(parameter_values['sesinomega_p' + str(i)],
-                                   parameter_values['secosomega_p' + str(i)])
+                deterministic = deterministic + out['NLM']
 
-            # Generate lightcurve for the current planet if ecc is OK:
-            if ecc > self.ecclim:
-                self.modelOK = False
-                return False
+        out['deterministic'] = deterministic
+        out['ok'] = ok
+        return out
 
-            # Save them to radvel:
-            self.model['radvel']['per' + str(n + 1)] = radvel.Parameter(value=P)
-            self.model['radvel']['tc' + str(n + 1)] = radvel.Parameter(value=t0)
-            self.model['radvel']['w' + str(n + 1)] = radvel.Parameter(
-                value=omega)  # note given in radians
-            self.model['radvel']['e' + str(n + 1)] = radvel.Parameter(value=ecc)
-            self.model['radvel']['k' + str(n + 1)] = radvel.Parameter(value=K)
+    def _linear_model(self, pv, instrument, lm_arguments):
+        LM = 0.
+        for i in range(self.lm_n[instrument]):
+            LM = LM + pv['theta' + str(i) + '_' + self.theta_iname[str(i) + instrument]] * lm_arguments[:, i]
+        return LM
 
-        # If log_like_calc is True (by default during juliet.fit), don't bother saving the RVs of planet p_i:
-        if self.log_like_calc:
-            self.model['Keplerian'] = radvel.model.RVModel(
-                self.model['radvel']).__call__(self.t)
-        else:
-            self.model['Keplerian'] = radvel.model.RVModel(
-                self.model['radvel']).__call__(self.t)
-            for n in range(self.nplanets):
-                i = self.numbering[n]
-                self.model['p' + str(i)] = radvel.model.RVModel(
-                    self.model['radvel']).__call__(self.t, planet_num=n + 1)
-
-        # If trends are being fitted, add them to the Keplerian+Trend model:
+    def _rv_keplerian(self, pv, t):
+        """Keplerian (plus trend) RV model at times t; returns per-planet keplerians, full keplerian, trend and an 'ok' flag."""
+        ok = jnp.array(True)
+        # Check the periods are chronologically ordered:
+        for i, j in zip(self.numbering[:-1], self.numbering[1:]):
+            ok = ok & (pv['P_p' + str(i)] < pv['P_p' + str(j)])
+        out = {}
+        keplerian = jnp.zeros_like(t)
+        for i in self.numbering:
+            si = str(i)
+            ecc, omega = self._ecc_omega(pv, i)
+            ok = ok & (ecc <= self.ecclim)
+            ecc = jnp.where(ecc < 1., ecc, 0.)
+            out['p' + si] = jm.rv_keplerian(t, pv['P_p' + si], pv['t0_p' + si], ecc, omega, pv['K_p' + si])
+            keplerian = keplerian + out['p' + si]
         if self.dictionary['fitrvline']:
-
-            self.model['Keplerian+Trend'] = self.model[
-                'Keplerian'] + parameter_values['rv_intercept'] + (
-                    self.t - self.ta) * parameter_values['rv_slope']
-
+            trend = pv['rv_intercept'] + (t - self.ta) * pv['rv_slope']
         elif self.dictionary['fitrvquad']:
-            self.model['Keplerian+Trend'] = self.model['Keplerian'] + parameter_values['rv_intercept'] + (self.t - self.ta)*parameter_values['rv_slope'] + \
-                                                                      ((self.t - self.ta)**2)*parameter_values['rv_quad']
+            trend = pv['rv_intercept'] + (t - self.ta) * pv['rv_slope'] + ((t - self.ta)**2) * pv['rv_quad']
         else:
-            self.model['Keplerian+Trend'] = self.model['Keplerian']
+            trend = jnp.zeros_like(t)
+        out['Keplerian'] = keplerian
+        out['trend'] = trend
+        out['ok'] = ok
+        return out
 
-        # Populate the self.model[instrument]['deterministic'] array. This hosts the full (deterministic) model for each RV instrument.
+    def _rv_instrument_model(self, pv, instrument, t, lm_arguments=None, include_lm=True, at_data_times=True):
+        out = self._rv_keplerian(pv, t)
+        out['M'] = out['Keplerian'] + out['trend'] + pv['mu_' + instrument]
+        deterministic = out['M']
+        if include_lm and self.lm_boolean[instrument]:
+            out['LM'] = self._linear_model(pv, instrument, lm_arguments)
+            deterministic = deterministic + out['LM']
+        out['deterministic'] = deterministic
+        return out
+
+    def _instrument_model(self, pv, instrument, t=None, lm_arguments=None, include_lm=True):
+        if t is None:
+            t, lm_arguments, at_data_times = self.jtimes[instrument], self.jlm_arguments.get(instrument), True
+        else:
+            t, at_data_times = jnp.asarray(t, dtype=float), False
+            if lm_arguments is not None:
+                lm_arguments = jnp.asarray(lm_arguments, dtype=float)
+        if self.modeltype == 'lc':
+            return self._lc_instrument_model(pv, instrument, t, lm_arguments, include_lm, at_data_times)
+        return self._rv_instrument_model(pv, instrument, t, lm_arguments, include_lm, at_data_times)
+
+    def _variances(self, pv, instrument):
+        if self.modeltype == 'lc':
+            return self.jerrors[instrument]**2 + (pv['sigma_w_' + self.sigmaw_iname[instrument]] * 1e-6)**2
+        return self.jerrors[instrument]**2 + pv['sigma_w_' + instrument]**2
+
+    def _global_model(self, pv, include_lm=True):
+        """Deterministic model and variances of all instruments, stacked in the global data arrays."""
+        deterministic = jnp.zeros(len(self.t))
+        variances = jnp.zeros(len(self.t))
+        ok = jnp.array(True)
+        outs = {}
         for instrument in self.inames:
-          
-            self.model[instrument]['deterministic'] = self.model[
-                'Keplerian+Trend'][self.instrument_indexes[
-                    instrument]] + parameter_values['mu_' + instrument]
-            
-            self.model[instrument]['deterministic_variances'] = self.errors[
-                instrument]**2 + parameter_values['sigma_w_' + instrument]**2
+            out = self._instrument_model(pv, instrument, include_lm=include_lm)
+            idx = self.instrument_indexes[instrument]
+            deterministic = deterministic.at[idx].set(out['deterministic'])
+            variances = variances.at[idx].set(self._variances(pv, instrument))
+            ok = ok & out['ok']
+            outs[instrument] = out
+        return deterministic, variances, ok, outs
 
-            if self.lm_boolean[instrument]:
-                self.model[instrument]['LM'] = np.zeros(
-                    self.ndatapoints_per_instrument[instrument])
-                for i in range(self.lm_n[instrument]):
-                    self.model[instrument]['LM'] += parameter_values[
-                        'theta' + str(i) + '_' +
-                        self.theta_iname[str(i)+instrument]] * self.lm_arguments[instrument][:, i]
-                self.model[instrument]['deterministic'] += self.model[
-                    instrument]['LM']
-            # If the model under consideration is a global model, populate the global model dictionary:
-            if self.global_model:
-                self.model['global'][self.instrument_indexes[
-                    instrument]] = self.model[instrument]['deterministic']
-                if evaluate_global_errors:
-                    self.model['global_variances'][self.instrument_indexes[instrument]] = self.yerr[self.instrument_indexes[instrument]]**2 + \
-                                                                                          parameter_values['sigma_w_'+instrument]**2
-
-    def get_GP_plus_deterministic_model(self,
-                                        parameter_values,
-                                        instrument=None):
-
+    def log_likelihood_fn(self, pv):
+        """Log-likelihood of the data given the parameter dictionary pv (pure JAX function)."""
         if self.global_model:
+            deterministic, variances, ok, _ = self._global_model(pv)
+            residuals = self.jy - deterministic
             if self.dictionary['global_model']['GPDetrend']:
-                #residuals = self.residuals #self.y - self.model['global']
-                self.dictionary['global_model'][
-                    'noise_model'].set_parameter_vector(parameter_values)
-                self.dictionary['global_model']['noise_model'].yerr = np.sqrt(
-                    self.variances)
-                self.dictionary['global_model']['noise_model'].compute_GP(
-                    X=self.original_GPregressors)
-                # Return mean signal plus GP model:
-                self.model['GP'] = self.dictionary['global_model']['noise_model'].GP.predict(self.residuals, self.dictionary['global_model']['noise_model'].X, \
-                                                                                                   return_var=False, return_cov=False)
-                return self.model['global'], self.model[
-                    'GP'], self.model['global'] + self.model['GP']
+                log_like = self.dictionary['global_model']['noise_model'].log_likelihood(pv, residuals, variances)
             else:
-                return self.model['global']
+                log_like = jm.gaussian_log_likelihood(residuals, variances)
         else:
-            if self.dictionary[instrument]['GPDetrend']:
-                #residuals = self.residuals#self.data[instrument] - self.model[instrument]['deterministic']
-                self.dictionary[instrument]['noise_model'].set_parameter_vector(
-                    parameter_values)
-                self.model[instrument]['GP'] = self.dictionary[instrument]['noise_model'].GP.predict(self.residuals,self.dictionary[instrument]['noise_model'].X, \
-                                               return_var=False, return_cov=False)
-                return self.model[instrument]['deterministic'], self.model[
-                    instrument]['GP'], self.model[instrument][
-                        'deterministic'] + self.model[instrument]['GP']
+            log_like = 0.
+            ok = jnp.array(True)
+            for instrument in self.inames:
+                out = self._instrument_model(pv, instrument)
+                ok = ok & out['ok']
+                residuals = self.jdata[instrument] - out['deterministic']
+                variances = self._variances(pv, instrument)
+                if self.dictionary[instrument]['GPDetrend']:
+                    log_like = log_like + self.dictionary[instrument]['noise_model'].log_likelihood(pv, residuals, variances)
+                else:
+                    log_like = log_like + jm.gaussian_log_likelihood(residuals, variances)
+        return jnp.where(ok, log_like, -jnp.inf)
+
+    def _parameter_dictionary(self, parameter_values):
+        pv = {p: jnp.asarray(v, dtype=float) for p, v in self.fixed_values.items()}
+        for p, v in parameter_values.items():
+            if p != 'unnamed':
+                pv[p] = jnp.asarray(v, dtype=float)
+        return pv
+
+    def get_log_likelihood(self, parameter_values):
+        return float(self._log_likelihood_jit(self._parameter_dictionary(parameter_values)))
+
+    ###########################################################################################
+    # Model generation and evaluation
+    ###########################################################################################
+
+    def _generate_fn(self, pv):
+        outs = {}
+        if self.global_model:
+            outs['global'], outs['global_variances'], ok, per_instrument = self._global_model(pv)
+        else:
+            ok = jnp.array(True)
+            per_instrument = {}
+            for instrument in self.inames:
+                per_instrument[instrument] = self._instrument_model(pv, instrument)
+                ok = ok & per_instrument[instrument]['ok']
+        for instrument in self.inames:
+            per_instrument[instrument]['deterministic_variances'] = self._variances(pv, instrument)
+        outs['instruments'] = per_instrument
+        if self.modeltype == 'rv':
+            outs['rv'] = self._rv_keplerian(pv, jnp.asarray(self.t, dtype=float))
+        outs['ok'] = ok
+        return outs
+
+    def generate_lc_model(self, parameter_values, evaluate_global_errors=True, evaluate_lc=False):
+        """Evaluates the lightcurve model on the data at the given parameter values; results are saved to self.model."""
+        return self._generate(parameter_values)
+
+    def generate_rv_model(self, parameter_values, evaluate_global_errors=True):
+        """Evaluates the RV model on the data at the given parameter values; results are saved to self.model."""
+        return self._generate(parameter_values)
+
+    def _generate(self, parameter_values):
+        outs = jax.tree.map(np.asarray, self._generate_jit(self._parameter_dictionary(parameter_values)))
+        self.modelOK = bool(outs['ok'])
+        if self.global_model:
+            self.model['global'] = outs['global']
+            self.model['global_variances'] = outs['global_variances']
+        for instrument in self.inames:
+            for k, v in outs['instruments'][instrument].items():
+                if k != 'ok':
+                    self.model[instrument][k] = v
+        if self.modeltype == 'rv':
+            for i in self.numbering:
+                self.model['p' + str(i)] = outs['rv']['p' + str(i)]
+            self.model['Keplerian'] = outs['rv']['Keplerian']
+            self.model['Keplerian+Trend'] = outs['rv']['Keplerian'] + outs['rv']['trend']
+        if not self.modelOK:
+            return False
+
+    def _evaluate_single(self, pv, instrument, t, GPregressors, LMregressors, evaluate_transit):
+        """Model (and its components) for a single set of parameter values. Pure JAX function."""
+        include_lm = not evaluate_transit
+        result = {}
+        gp_on = (not evaluate_transit) and (self.dictionary['global_model']['GPDetrend'] if self.global_model
+                                            else self.dictionary[instrument]['GPDetrend'])
+        if self.global_model:
+            deterministic, variances, _, outs = self._global_model(pv, include_lm=include_lm)
+            if t is None:
+                result['deterministic'] = deterministic
+                evaluated = outs
             else:
-                return self.model[instrument]['deterministic']
+                lm = None if LMregressors is None or instrument not in LMregressors else LMregressors[instrument]
+                evaluated = dict(outs)
+                evaluated[instrument] = self._instrument_model(pv, instrument, t, lm, include_lm=include_lm)
+                result['deterministic'] = evaluated[instrument]['deterministic']
+            if gp_on:
+                residuals = self.jy - deterministic
+                result['GP'] = self.dictionary['global_model']['noise_model'].predict(pv, residuals, variances,
+                                                                                     None if t is None else GPregressors)
+        else:
+            outs = self._instrument_model(pv, instrument, include_lm=include_lm)
+            evaluated = {instrument: outs if t is None else self._instrument_model(pv, instrument, t, LMregressors,
+                                                                                  include_lm=include_lm)}
+            result['deterministic'] = evaluated[instrument]['deterministic']
+            if gp_on:
+                residuals = self.jdata[instrument] - outs['deterministic']
+                result['GP'] = self.dictionary[instrument]['noise_model'].predict(pv, residuals, self._variances(pv, instrument),
+                                                                                 None if t is None else GPregressors)
+        result['model'] = result['deterministic'] + result['GP'] if gp_on else result['deterministic']
+
+        # Components of the model:
+        components = {}
+        component_instruments = self.inames if self.global_model else [instrument]
+        for ginstrument in component_instruments:
+            out = evaluated[ginstrument]
+            c = {}
+            for i in self.numbering:
+                c['p' + str(i)] = out.get('p' + str(i), jnp.ones_like(out['M']))
+            if self.modeltype == 'lc':
+                c['transit'] = 1. + sum(c['p' + str(i)] - 1. for i in self.numbering)
+            else:
+                c['keplerian'] = out['Keplerian']
+                c['trend'] = out['trend']
+                c['mu'] = pv['mu_' + ginstrument]
+            c['lm'] = out.get('LM', jnp.zeros_like(out['M']))
+            components[ginstrument] = c
+        result['components'] = components
+        return result
 
     def evaluate_model(self, instrument = None, parameter_values = None,
                           all_samples = False, nsamples = 1000, return_samples = False, t = None, GPregressors = None, LMregressors = None,
@@ -2681,6 +2547,8 @@ class model(object):
                              >>> dataset = juliet.load(priors=priors, t_rv = times, y_rv = fluxes, yerr_rv = fluxes_error)
                              >>> results = dataset.fit()
                              >>> rv_model, error68_up, error68_down = results.rv.evaluate('FEROS', return_err=True)
+
+        Models for all the posterior samples are evaluated in a vectorized way with JAX.
 
         :param instrument: (optional, string)
         Instrument the user wants to evaluate the model on. It is expected to be given for non-global models, not necessary for global models.
@@ -2705,7 +2573,7 @@ class model(object):
         Array with the times at which the model wants to be evaluated.
 
         :param GPRegressors: (optional, numpy array)
-        Array containing the GP Regressors onto which to evaluate the models. Dimensions must be consistent with input `t`. If model is global, this needs to be a dictionary.
+        Array containing the GP Regressors onto which to evaluate the models. Dimensions must be consistent with input `t`.
 
         :param LMRegressors: (optional, numpy array or dictionary)
         If the model is not global, this is an array containing the Linear Regressors onto which to evaluate the model for the input instrument.
@@ -2726,21 +2594,10 @@ class model(object):
         :returns: By default, the function returns the median model as evaluated with the posterior samples. Depending on the options chosen by the user, this can return up to 5 elements (in that order): `model_samples`, `median_model`, `upper_CI`, `lower_CI` and `components`. The first is an array with all the model samples as evaluated from the posterior. The second is the median model. The third and fourth are the uppper and lower Credibility Intervals, and the latter is a dictionary with the model components.
 
         """
-        if evaluate_transit:
-            if self.modeltype != 'lc':
-                raise Exception(
-                    "Trying to evaluate a transit (evaluate_transit = True) in a non-lightcurve model is not allowed."
-                )
-
-            # Save LM and GP booleans, turn them off:
-            true_lm_boolean = self.lm_boolean[instrument]
-            self.lm_boolean[instrument] = False
-            if self.global_model:
-                true_gp_boolean = self.dictionary['global_model']['GPDetrend']
-                self.dictionary['global_model']['GPDetrend'] = False
-            else:
-                true_gp_boolean = self.dictionary[instrument]['GPDetrend']
-                self.dictionary[instrument]['GPDetrend'] = False
+        if evaluate_transit and self.modeltype != 'lc':
+            raise Exception(
+                "Trying to evaluate a transit (evaluate_transit = True) in a non-lightcurve model is not allowed."
+            )
 
         # If no instrument is given, assume user wants a global model evaluation:
         if instrument is None:
@@ -2749,752 +2606,78 @@ class model(object):
                     "Input error: an instrument has to be defined for non-global models in order to evaluate the model."
                 )
 
-        if self.modeltype == 'lc':
+        if t is not None:
+            gp_on = (self.dictionary['global_model']['GPDetrend'] if self.global_model else self.dictionary[instrument]['GPDetrend'])
+            if gp_on and (not evaluate_transit) and GPregressors is None:
+                raise Exception("\t Model for instrument " + str(instrument) +
+                                " has a GP, and requires a GPregressors to be inputted to be evaluated.")
+            if self.global_model and LMregressors is not None:
+                LMregressors = {k: jnp.asarray(v, dtype=float) for k, v in LMregressors.items()}
 
-            nresampling = self.dictionary[instrument].get('nresampling')
-            etresampling = self.dictionary[instrument].get('exptimeresampling')
+        if parameter_values is None:
+            parameter_values = self.posteriors
 
-            if not self.dictionary[instrument]['TransitFitCatwoman']:
+        input_parameters = [p for p in parameter_values.keys() if p not in ['unnamed', 'loglike']]
 
-                if self.dictionary[instrument]['TransitFit']:
-                
-                    self.model[instrument]['params'], [self.model[instrument]['m'],_] = init_batman(self.times[instrument], self.dictionary[instrument]['ldlaw'],
-                                                                                                    nresampling=nresampling, etresampling=etresampling)
-                elif self.dictionary[instrument]['EclipseFit']:
-                
-                    self.model[instrument]['params'], [_,self.model[instrument]['m']] = init_batman(self.times[instrument], self.dictionary[instrument]['ldlaw'],
-                                                                                                    nresampling=nresampling, etresampling=etresampling)
-                    
-                elif self.dictionary[instrument]['TranEclFit']:
-                
-                    self.model[instrument]['params'], self.model[instrument]['m'] = init_batman(self.times[instrument], self.dictionary[instrument]['ldlaw'],
-                                                                                                    nresampling=nresampling, etresampling=etresampling)
+        def single(pv):
+            return self._evaluate_single(pv, instrument, t, GPregressors, LMregressors, evaluate_transit)
+
+        if type(parameter_values[input_parameters[0]]) is np.ndarray:
+            # To generate a median model first generate an output_model_samples array that will save the model at each evaluation. This will
+            # save nsamples samples of the posterior model. If all_samples = True, all samples from the posterior are used for the evaluated model:
+            nsampled = len(parameter_values[input_parameters[0]])
+            if all_samples:
+                nsamples = nsampled
+                idx_samples = np.arange(nsamples)
             else:
-                self.model[instrument]['params'], self.model[instrument]['m'] = init_catwoman(self.times[instrument], self.dictionary[instrument]['ldlaw'],
-                                                                                                nresampling=nresampling, etresampling=etresampling)
+                idx_samples = np.random.choice(np.arange(nsampled),
+                                               np.min([nsamples, nsampled]),
+                                               replace=False)
+                idx_samples = idx_samples[np.argsort(idx_samples)]
 
+            batch = self._parameter_dictionary({p: np.asarray(parameter_values[p])[idx_samples] for p in input_parameters})
+            for p in self.fixed_values:
+                batch[p] = jnp.full(len(idx_samples), self.fixed_values[p])
 
-        # Save the original inames in the case of non-global models, and set self.inames to the input model. This is because if the model
-        # is not global, in general we don't care about generating the models for the other instruments (and in the lightcurve and RV evaluation part,
-        # self.inames is used to iterate through the instruments one wants to evaluate the model):
+            # Evaluate all samples (in batches, to keep the memory footprint bounded):
+            results = jax.tree.map(np.asarray, jax.lax.map(jax.jit(single), batch, batch_size=min(len(idx_samples), self.batch_size)))
 
-        if not self.global_model:
-            original_inames = copy.deepcopy(self.inames)
-            self.inames = [instrument]
-            instruments = self.dictionary.keys()
-        else:
-            instruments = self.inames
-        # Check if user gave input parameter_values dictionary. If that's the case, generate again the
-        # full lightcurve/rv model:
-        if parameter_values is not None:
-            # If return_components, generate the components dictionary:
+            output_model_samples = results['model']
+            gp_on = 'GP' in results
+            if return_err:
+                m_output_model, u_output_model, l_output_model = _quantiles(output_model_samples, alpha=alpha)
+            else:
+                output_model = np.nanmedian(output_model_samples, axis=0)
+
+            # Save the deterministic and GP parts of the model (as in previous juliet versions):
+            if gp_on:
+                target = self.model if self.global_model else self.model[instrument]
+                if return_err:
+                    target['deterministic'], target['deterministic_uerror'], target['deterministic_lerror'] = \
+                        _quantiles(results['deterministic'], alpha=alpha)
+                    target['GP'], target['GP_uerror'], target['GP_lerror'] = _quantiles(results['GP'], alpha=alpha)
+                else:
+                    target['deterministic'] = np.nanmedian(results['deterministic'], axis=0)
+                    target['GP'] = np.nanmedian(results['GP'], axis=0)
+
             if return_components:
-                self.log_like_calc = False
-                components = {}
-            # Now, consider two possible cases. If the user is giving a parameter_values where the dictionary contains *arrays* of values
-            # in it, then iterate through all the values in order to calculate the median model. If the dictionary contains only individual
-            # values, evaluate the model only at those values:
-            parameters = list(self.priors.keys())
-            input_parameters = list(parameter_values.keys())
-            if type(parameter_values[input_parameters[0]]) is np.ndarray:
-                # To generate a median model first generate an output_model_samples array that will save the model at each evaluation. This will
-                # save nsamples samples of the posterior model. If all_samples = True, all samples from the posterior are used for the evaluated model
-                # (this is slower, but user might not care). First create idx_samples, which will save the indexes of the samples:
-                nsampled = len(parameter_values[input_parameters[0]])
-                if all_samples:
-                    nsamples = nsampled
-                    idx_samples = np.arange(nsamples)
-                else:
-                    idx_samples = np.random.choice(np.arange(nsampled),
-                                                   np.min([nsamples, nsampled]),
-                                                   replace=False)
-                    idx_samples = idx_samples[np.argsort(idx_samples)]
-
-                # Create the output_model arrays: these will save on each iteration the full model (lc/rv + GP, output_model_samples), 
-                # the GP-only model (GP, output_modelGP_samples) and the lc/rv-only model (lc/rv, output_modelDET_samples) --- the latter ones 
-                # will make sense only if there is a GP model. If not, it will be a zero-array throughout the evaluation process:
-                if t is None:
-                    # If user did not give input times, then output samples follow the times on which the model was fitted:
-                    if self.global_model:
-                        output_model_samples = np.zeros(
-                            [nsamples, self.ndatapoints_all_instruments])
-                    else:
-                        output_model_samples = np.zeros([
-                            nsamples,
-                            self.ndatapoints_per_instrument[instrument]
-                        ])
-                else:
-                    # If user gave input times (usually extrapolating from the times the model was fitted on), then
-                    # save the number of points in this input array:
-                    nt = len(t)
-                    # And modify the length of the output samples, which will now be a matrix with dimensions (number of samples, input times):
-                    output_model_samples = np.zeros([nsamples, nt])
-                    if self.global_model:
-                        # If model is global, it means there is an underlying global noise model, so we have to evaluate the model in *all* the instruments
-                        # because the GP component is only extractable once we have the full residuals. Because of this, we generate dictionaries that save
-                        # the original number of datapoints for each instrument and the original times of each instrument. This is useful because later we
-                        # will switch back and forth from the original times (to evaluate the model and get the residuals) to the input times (to generate
-                        # predictions):
-                        nt_original, original_instrument_times = {}, {}
-                        for ginstrument in instruments:
-                            nt_original[ginstrument] = len(
-                                self.times[ginstrument])
-                            original_instrument_times[ginstrument] = copy.deepcopy(
-                                self.times[ginstrument])
-                    else:
-                        # If model is not global, we don't care about generating the model for all the instruments --- we do it only for the instrument
-                        # of interest. In this case, the nt_original and original_instrument_times are not dictionaries but "simple" arrays saving the
-                        # number of datapoints for that instrument and the times for that instrument.
-                        nt_original = len(self.times[instrument])
-                        original_instrument_times = copy.deepcopy(
-                            self.times[instrument])
-                    if self.modeltype == 'lc':
-                        # If we are trying to evaluate a lightcurve mode then, again what we do will depend depending if this is a global model or not. In both,
-                        # the idea is to save the lightcurve generating objects both using the input times and the original times:
-                        if self.global_model:
-                            # If global model, then iterate through all the instruments of the fit. If the TransitFit or TransitFitCatwoman is true,
-                            # then generate the model-generating objects for those instruments using both the input times and the model-fit times. Save
-                            # those in dictionaries:
-                            for ginstrument in instruments:
-
-                                if self.dictionary[ginstrument]['TransitFit'] or self.dictionary[ginstrument]['TransitFitCatwoman'] or self.dictionary[ginstrument]['EclipseFit'] or self.dictionary[ginstrument]['TranEclFit']:
-    
-                                    nresampling = self.dictionary[ginstrument].get('nresampling')
-                                    etresampling = self.dictionary[ginstrument].get('exptimeresampling')
-                                    supersample_params, supersample_m = {}, {}
-                                    sample_params, sample_m = {}, {}
-            
-                                    if not self.dictionary[ginstrument]['TransitFitCatwoman']:
-                
-                                        if self.dictionary[ginstrument]['TransitFit']:
-                
-                                            supersample_params[ginstrument],[supersample_m[ginstrument],_] = init_batman(t, self.dictionary[ginstrument]['ldlaw'],
-                                                                                                                         nresampling=nresampling, etresampling=etresampling)
-                                            sample_params[ginstrument],[sample_m[ginstrument],_] = init_batman(self.times[ginstrument], self.dictionary[ginstrument]['ldlaw'],
-                                                                                                               nresampling=nresampling, etresampling=etresampling)
-                    
-                                        elif self.dictionary[ginstrument]['EclipseFit']:
-                        
-                                            supersample_params[ginstrument],[_,supersample_m[ginstrument]] = init_batman(t, self.dictionary[ginstrument]['ldlaw'],
-                                                                                                                         nresampling=nresampling, etresampling=etresampling)
-                                            sample_params[ginstrument],[_,sample_m[ginstrument]] = init_batman(self.times[ginstrument], self.dictionary[ginstrument]['ldlaw'],
-                                                                                                               nresampling=nresampling, etresampling=etresampling)
-                            
-                                        elif self.dictionary[ginstrument]['TranEclFit']:
-                                
-                                            supersample_params[ginstrument],supersample_m[ginstrument] = init_batman(t, self.dictionary[ginstrument]['ldlaw'],
-                                                                                                                     nresampling=nresampling, etresampling=etresampling)
-                                            sample_params[ginstrument],sample_m[ginstrument] = init_batman(self.times[ginstrument], self.dictionary[ginstrument]['ldlaw'],
-                                                                                                           nresampling=nresampling, etresampling=etresampling)                     
-                        
-
-                                    else:
-                                        supersample_params[ginstrument],supersample_m[ginstrument] = init_catwoman(t, self.dictionary[ginstrument]['ldlaw'],
-                                                                                                                   nresampling=nresampling, etresampling=etresampling)
-                                        sample_params[ginstrument],sample_m[ginstrument] = init_catwoman(self.times[ginstrument], self.dictionary[ginstrument]['ldlaw'],
-                                                                                                         nresampling=nresampling, etresampling=etresampling)
-                        else:
-                            # If model is not global, the variables saved are not dictionaries but simply the objects, as we are just going to evaluate the
-                            # model for one dataset (the one of the input instrument):
-
-                            if self.dictionary[instrument]['TransitFit'] or self.dictionary[instrument]['TransitFitCatwoman'] or self.dictionary[instrument]['EclipseFit'] or self.dictionary[instrument]['TranEclFit']:
-    
-                                nresampling = self.dictionary[instrument].get('nresampling')
-                                etresampling = self.dictionary[instrument].get('exptimeresampling')
-        
-                                if not self.dictionary[instrument]['TransitFitCatwoman']:
-            
-                                    if self.dictionary[instrument]['TransitFit']:
-
-                                        supersample_params,[supersample_m,_] = init_batman(t, self.dictionary[instrument]['ldlaw'],
-                                                                                           nresampling=nresampling, etresampling=etresampling)
-
-                                        sample_params,[sample_m,_] = init_batman(self.times[instrument], self.dictionary[instrument]['ldlaw'],
-                                                                                 nresampling=nresampling, etresampling=etresampling)
-                    
-                                    elif self.dictionary[instrument]['EclipseFit']:
-
-                                         supersample_params,[_,supersample_m] = init_batman(t, self.dictionary[instrument]['ldlaw'],
-                                                                                            nresampling=nresampling, etresampling=etresampling)
-
-                                         sample_params,[_,sample_m] = init_batman(self.times[instrument], self.dictionary[instrument]['ldlaw'],
-                                                                                  nresampling=nresampling, etresampling=etresampling)
-                            
-                                    elif self.dictionary[instrument]['TranEclFit']:
-
-                                        supersample_params,supersample_m = init_batman(t, self.dictionary[instrument]['ldlaw'],
-                                                                                       nresampling=nresampling, etresampling=etresampling)
-
-                                        sample_params,sample_m = init_batman(self.times[instrument], self.dictionary[instrument]['ldlaw'],
-                                                                             nresampling=nresampling, etresampling=etresampling)
-
-                                else:
-                                    supersample_params,supersample_m = init_catwoman(t, self.dictionary[instrument]['ldlaw'],
-                                                                                     nresampling=nresampling, etresampling=etresampling)
-                                    sample_params,sample_m = init_catwoman(self.times[instrument], self.dictionary[instrument]['ldlaw'],
-                                                                           nresampling=nresampling, etresampling=etresampling)
-
-                    else:
-                        # If we are trying to evaluate radial-velocities, we don't need to generate objects because radvel receives the times as inputs
-                        # on each call. In this case then we save the original times (self.t has *all* the times of all the instruments) and instrument
-                        # indexes (remember self.t[self.instrument_indexes[yourinstrument]] returns the times of yourinstrument):
-                        original_t = copy.deepcopy(self.t)
-                        if self.global_model:
-                            # If global model, copy all the possible instrument indexes to the original_instrument_indexes:
-                            original_instrument_indexes = copy.deepcopy(self.instrument_indexes)
-                        else:
-                            # If not global, assume indexes for selected instrument are all the user-inputted t's. Also, save only the instrument
-                            # indexes corresponding to the instrument of interest. The others don't matter so we don't save them:
-                            original_instrument_index = self.instrument_indexes[
-                                instrument]
-                        dummy_indexes = np.arange(len(t))
-                # Fill the components dictionary in case return_components is true; use the output_model_samples for the size of each component array.
-                # If global model, and the model being evaluated is a lightcurve, remember to give back one planet component per instrument because
-                # each instrument might have different limb-darkening laws. To this, end, in that case, the components['p'+str(i)] dictionary is, itself,
-                # a dictionary. Same thing for the components['transit'] dictionary:
-                if return_components:
-                    for i in self.numbering:
-                        if self.global_model and self.modeltype == 'lc':
-                            components['p' + str(i)] = {}
-                            for ginstrument in instruments:
-                                components['p' +
-                                           str(i)][ginstrument] = np.zeros(
-                                               output_model_samples.shape)
-                        else:
-                            components['p' + str(i)] = np.zeros(
-                                output_model_samples.shape)
-                    if self.global_model:
-                        components['lm'] = {}
-                        for ginstrument in instruments:
-                            components['lm'][ginstrument] = np.zeros(
-                                output_model_samples.shape)
-                    else:
-                        components['lm'] = np.zeros(output_model_samples.shape)
-                    if self.modeltype == 'lc':
-                        if self.global_model:
-                            components['transit'] = {}
-                            for ginstrument in instruments:
-                                components['transit'][ginstrument] = np.zeros(
-                                    output_model_samples.shape)
-                        else:
-                            components['transit'] = np.zeros(
-                                output_model_samples.shape)
-                    else:
-
-                        components['keplerian'] = np.zeros(output_model_samples.shape)
-                        components['trend'] = np.zeros(output_model_samples.shape)
-
-                        if self.global_model:
-                            components['mu'] = {}
-                            for ginstrument in instruments:
-                                components['mu'][ginstrument] = np.zeros(
-                                    output_model_samples.shape[0])
-                        else:
-                            components['mu'] = np.zeros(
-                                output_model_samples.shape[0])
-
-                # IF GP detrend, there is an underlying GP being applied. Generate arrays that will save the GP and deterministic component:
-                if self.global_model:
-                    if self.dictionary['global_model']['GPDetrend']:
-                        output_modelGP_samples = copy.deepcopy(output_model_samples)
-                        output_modelDET_samples = copy.deepcopy(output_model_samples)
-                else:
-                    if self.dictionary[instrument]['GPDetrend']:
-                        output_modelGP_samples = copy.deepcopy(output_model_samples)
-                        output_modelDET_samples = copy.deepcopy(output_model_samples)
-
-                # Create dictionary that saves the current parameter_values to evaluate:
-                current_parameter_values = dict.fromkeys(parameters)
-
-                # Having defined everything, we now finally start evaluation the model. First go through all parameters in the prior; fix the ones
-                # which are fixed:
-                for parameter in parameters:
-                    if self.priors[parameter]['distribution'] == 'fixed':
-
-                        current_parameter_values[parameter] = self.priors[parameter]['hyperparameters']
-
-                # If extrapolating the model, save the current GPregressors and current linear
-                # regressors. Save the input GPRegressors to the self.dictionary. Note this is done because
-                # we won't be evaluating the likelihood on each iteration, so we don't need the original GP Regressors,
-                # but only the input ones ad the residuals are generated deterministically. These residuals are passed
-                # to the GP objet to generate samples from the GP. This latter is not true for the linear model, because it
-                # is a determinisitc model an needs to be evaluated on each iteration on both the input regressors of the
-                # fit (to generate the residuals) and on the input regressors to this function (to generate predictions):
-                if t is not None:
-                    if self.global_model:
-                        original_lm_arguments = copy.deepcopy(self.lm_arguments)
-                        if self.dictionary['global_model']['GPDetrend']:
-                            self.original_GPregressors = copy.deepcopy(
-                                self.dictionary['global_model']
-                                ['noise_model'].X)
-                            self.dictionary['global_model'][
-                                'noise_model'].X = GPregressors
-                            if GPregressors is None:
-                                raise Exception(
-                                    "\t Gobal model has a GP, and requires a GPregressors to be inputted to be evaluated."
-                                )
-                    else:
-                        if self.dictionary[instrument]['GPDetrend']:
-                            self.dictionary[instrument][
-                                'noise_model'].X = GPregressors
-                            if GPregressors is None:
-                                raise Exception(
-                                    "\t Model for instrument " + instrument +
-                                    " has a GP, and requires a GPregressors to be inputted to be evaluated."
-                                )
-                        if self.lm_boolean[instrument]:
-                            original_lm_arguments = copy.deepcopy(
-                                self.lm_arguments[instrument])
-
-                # Now iterate through all samples:
-                counter = 0
-                for i in idx_samples:
-                    # Get parameters for the i-th sample:
-                    for parameter in input_parameters:
-                        # Populate the current parameter_values
-                        current_parameter_values[parameter] = parameter_values[
-                            parameter][i]
-
-                    # Evaluate rv/lightcurve at the current parameter values, calculate residuals, save them:
-                    if self.modeltype == 'lc':
-                        self.generate_lc_model(current_parameter_values,
-                                               evaluate_lc=True)
-                    else:
-                        self.generate_rv_model(current_parameter_values,
-                                               evaluate_global_errors=True)
-
-                    # Save residuals (and global errors, in the case of global models):
-                    if self.global_model:
-                        self.residuals = self.y - self.model['global']
-                        self.variances = self.model['global_variances']
-                    else:
-                        self.residuals = self.data[instrument] - self.model[
-                            instrument]['deterministic']
-
-                    # If extrapolating (t is not None), evaluate the extrapolated model with a lightcurve/rv model
-                    # considering the input times and not the current dataset times:
-                    if t is not None:
-                        if self.modeltype == 'lc':
-                            if self.global_model:
-                                # If global model, set all super-sample objects to evaluate at the input times:
-                                for ginstrument in instruments:
-
-                                    if self.dictionary[ginstrument]['TransitFit'] or self.dictionary[ginstrument]['TransitFitCatwoman'] or self.dictionary[ginstrument]['EclipseFit'] or self.dictionary[ginstrument]['TranEclFit']:
-                                        self.model[ginstrument]['params'], self.model[ginstrument]['m'] = supersample_params[ginstrument],supersample_m[ginstrument]
-
-                                    if self.lm_boolean[ginstrument]:
-                                        self.lm_arguments[
-                                            ginstrument] = LMregressors[
-                                                ginstrument]
-                                    self.model[ginstrument]['ones'] = np.ones(
-                                        nt)
-                                    self.ndatapoints_per_instrument[
-                                        ginstrument] = nt
-                                    self.instrument_indexes[
-                                        ginstrument] = dummy_indexes
-                                original_inames = copy.deepcopy(self.inames)
-                                self.inames = [instrument]
-                                self.generate_lc_model(
-                                    current_parameter_values,
-                                    evaluate_global_errors=False,
-                                    evaluate_lc=True)
-                                self.inames = original_inames
-                            else:
-                                # If not, set them only for the instrument of interest:
-
-                                if self.dictionary[instrument]['TransitFit'] or self.dictionary[instrument]['TransitFitCatwoman'] or self.dictionary[instrument]['EclipseFit'] or self.dictionary[instrument]['TranEclFit']:
-                                    self.model[instrument]['params'], self.model[instrument]['m'] = supersample_params,supersample_m
-
-                                if self.lm_boolean[instrument]:
-                                    self.lm_arguments[instrument] = LMregressors
-                                self.model[instrument]['ones'] = np.ones(nt)
-                                self.ndatapoints_per_instrument[instrument] = nt
-                                # Generate lightcurve model:
-
-                                self.generate_lc_model(
-                                    current_parameter_values,
-                                    evaluate_global_errors=False,
-                                    evaluate_lc=True)
-
-                        else:
-                            # As with the lc case, RV model set-up depends on whether the model is global or not:
-                            self.t = t
-                            if self.global_model:
-                                # If global, in the model evaluation part (generate_rv_model function), the model for each instrument is evaluated at
-                                # certain indexes self.instrument_indexes[instrument]. We here decide that on each instrument we will evaluate the model
-                                # at all the input times t (this is what the dummy_index variable does), so we fill up this dictionary with that.
-                                self.model['global'] = np.ones(len(t))
-                                for ginstrument in instruments:
-                                    if self.lm_boolean[ginstrument]:
-                                        self.lm_arguments[
-                                            ginstrument] = LMregressors[
-                                                ginstrument]
-                                    self.times[ginstrument] = t
-                                    self.instrument_indexes[
-                                        ginstrument] = dummy_indexes
-                                # Generate RV model only for the instrument under consideration:
-                                original_inames = copy.deepcopy(self.inames)
-                                self.inames = [instrument]
-                                self.generate_rv_model(
-                                    current_parameter_values,
-                                    evaluate_global_errors=False)
-                                self.inames = original_inames
-                            else:
-                                self.times[instrument] = t
-                                self.instrument_indexes[
-                                    instrument] = dummy_indexes
-                                if self.lm_boolean[instrument]:
-                                    self.lm_arguments[instrument] = LMregressors
-                                # Generate RV model:
-                                self.generate_rv_model(
-                                    current_parameter_values,
-                                    evaluate_global_errors=False)
-
-                    if self.global_model:
-                        if self.dictionary['global_model']['GPDetrend']:
-                            output_modelDET_samples[counter,:], output_modelGP_samples[counter,:], output_model_samples[counter,:] = \
-                                                                     self.get_GP_plus_deterministic_model(current_parameter_values, \
-                                                                                                             instrument = instrument)
-                        else:
-                            output_model_samples[counter,:] = self.get_GP_plus_deterministic_model(current_parameter_values, \
-                                                                                                  instrument = instrument)
-                    else:
-                        if self.dictionary[instrument]['GPDetrend']:
-                            output_modelDET_samples[counter,:], output_modelGP_samples[counter,:], output_model_samples[counter,:] = \
-                                                                     self.get_GP_plus_deterministic_model(current_parameter_values, \
-                                                                                                             instrument = instrument)
-                        else:
-                            output_model_samples[counter,:] = self.get_GP_plus_deterministic_model(current_parameter_values, \
-                                                                                                  instrument = instrument)
-
-                    # Now, if user wants component back, again all depends if global model is on or not but only for the lightcurves
-                    # (which depend on limb-darkening). For the RVs it doesn't matter except for 'mu' (the systemic velocity), which
-                    # for global models is actually a dictionary:
-                    if return_components:
-                        if self.modeltype == 'lc':
-                            if self.global_model:
-                                # If it is, then the components['p'+str(i)] dictionary will have to be a dictionary on itself,
-                                # such that we return the global transit model for each of the instruments. Same thing for the
-                                # components['transit'] dictionary.
-                                for ginstrument in instruments:
-                                    transit = 0.
-                                    for i in self.numbering:
-                                        components['p' + str(i)][ginstrument][
-                                            counter, :] = self.model[
-                                                ginstrument]['p' + str(i)]
-                                        transit += (components['p' + str(i)]
-                                                    [ginstrument][counter, :] -
-                                                    1.)
-                                    components['transit'][ginstrument][
-                                        counter, :] = 1. + transit
-                            else:
-                                transit = 0.
-                                for i in self.numbering:
-                                    components['p' + str(i)][
-                                        counter, :] = self.model[instrument][
-                                            'p' + str(i)]
-                                    transit += (
-                                        components['p' + str(i)][counter, :] -
-                                        1.)
-                                components['transit'][counter, :] = 1. + transit
-                        else:
-                          
-                            for i in self.numbering:
-
-                                components['p'+str(i)][counter,:] = self.model['p'+str(i)]
-                                
-                            components['trend'][counter,:] = self.model['Keplerian+Trend'] - self.model['Keplerian']
-                            components['keplerian'][counter,:] = self.model['Keplerian']
-
-                            if self.global_model:
-                                for ginstrument in instruments:
-                                    components['mu'][ginstrument][
-                                        counter] = current_parameter_values[
-                                            'mu_' + ginstrument]
-                            else:
-                                components['mu'][
-                                    counter] = current_parameter_values[
-                                        'mu_' + instrument]
-                        if self.global_model:
-                            for ginstrument in instruments:
-                                if self.lm_boolean[ginstrument]:
-                                    components['lm'][ginstrument][
-                                        counter, :] = self.model[ginstrument][
-                                            'LM']
-                        else:
-                            if self.lm_boolean[instrument]:
-                                components['lm'][
-                                    counter, :] = self.model[instrument]['LM']
-
-                    # Rollback in case t is not None:
-                    if t is not None:
-                        if self.global_model:
-
-                            self.instrument_indexes = copy.deepcopy(original_instrument_indexes)
-
-                            for ginstrument in instruments:
-                                self.times[
-                                    ginstrument] = original_instrument_times[
-                                        ginstrument]
-                                if self.modeltype == 'lc':
-
-                                    if self.dictionary[ginstrument]['TransitFit'] or self.dictionary[ginstrument]['TransitFitCatwoman'] or self.dictionary[ginstrument]['EclipseFit'] or self.dictionary[ginstrument]['TranEclFit']:
-                                        self.model[ginstrument]['params'], self.model[ginstrument]['m'] = sample_params[ginstrument],sample_m[ginstrument]
-
-                                    if self.lm_boolean[ginstrument]:
-                                        self.lm_arguments[
-                                            ginstrument] = original_lm_arguments[
-                                                ginstrument]
-                                    self.model[ginstrument]['ones'] = np.ones(
-                                        nt_original[ginstrument])
-                                else:
-                                    self.t = original_t
-                                    self.model['global'] = np.ones(
-                                        len(original_t))
-                                self.ndatapoints_per_instrument[
-                                    ginstrument] = nt_original[ginstrument]
-                        else:
-                            self.times[instrument] = original_instrument_times
-                            if self.modeltype == 'lc':
-
-                                if self.dictionary[instrument]['TransitFit'] or self.dictionary[instrument]['EclipseFit'] or self.dictionary[instrument]['TranEclFit']:
-                                    self.model[instrument]['params'], self.model[instrument]['m'] = sample_params,sample_m
-
-                                if self.lm_boolean[instrument]:
-                                    self.lm_arguments[
-                                        instrument] = original_lm_arguments
-                                self.model[instrument]['ones'] = np.ones(
-                                    nt_original)
-                            else:
-                                self.t = original_t
-
-                                self.instrument_indexes[instrument] = original_instrument_index
-                                
-                            self.ndatapoints_per_instrument[instrument] = nt_original
-
-                    counter += 1
-                # If return_error is on, return upper and lower sigma (alpha x 100% CI) of the model(s):
-                if return_err:
-                    m_output_model, u_output_model, l_output_model = np.zeros(output_model_samples.shape[1]),\
-                                                                     np.zeros(output_model_samples.shape[1]),\
-                                                                     np.zeros(output_model_samples.shape[1])
-                    if self.global_model:
-                        if self.dictionary['global_model']['GPDetrend']:
-                            mDET_output_model, uDET_output_model, lDET_output_model = np.copy(m_output_model), np.copy(u_output_model), \
-                                                                                   np.copy(l_output_model)
-
-                            mGP_output_model, uGP_output_model, lGP_output_model = np.copy(m_output_model), np.copy(u_output_model), \
-                                                                                   np.copy(l_output_model)
-                        for i in range(output_model_samples.shape[1]):
-                            m_output_model[i], u_output_model[
-                                i], l_output_model[i] = get_quantiles(
-                                    output_model_samples[:, i], alpha=alpha)
-                            if self.dictionary['global_model']['GPDetrend']:
-                                mDET_output_model[i], uDET_output_model[
-                                    i], lDET_output_model[i] = get_quantiles(
-                                        output_modelDET_samples[:, i],
-                                        alpha=alpha)
-                                mGP_output_model[i], uGP_output_model[
-                                    i], lGP_output_model[i] = get_quantiles(
-                                        output_modelGP_samples[:, i],
-                                        alpha=alpha)
-                        if self.dictionary['global_model']['GPDetrend']:
-                            self.model['deterministic'], self.model[
-                                'GP'] = mDET_output_model, mGP_output_model
-                            self.model['deterministic_uerror'], self.model[
-                                'GP_uerror'] = uDET_output_model, uGP_output_model
-                            self.model['deterministic_lerror'], self.model[
-                                'GP_lerror'] = lDET_output_model, lGP_output_model
-                    else:
-                        if self.dictionary[instrument]['GPDetrend']:
-                            mDET_output_model, uDET_output_model, lDET_output_model = np.copy(m_output_model), np.copy(u_output_model), \
-                                                                                   np.copy(l_output_model)
-
-                            mGP_output_model, uGP_output_model, lGP_output_model = np.copy(m_output_model), np.copy(u_output_model), \
-                                                                                   np.copy(l_output_model)
-                        for i in range(output_model_samples.shape[1]):
-                          
-                            m_output_model[i], u_output_model[
-                                i], l_output_model[i] = get_quantiles(
-                                    output_model_samples[:, i], alpha=alpha)
-                            
-                            if self.dictionary[instrument]['GPDetrend']:
-
-                                mDET_output_model[i], uDET_output_model[i], lDET_output_model[i] = get_quantiles(output_modelDET_samples[:,i], alpha = alpha)
-                                mGP_output_model[i], uGP_output_model[i], lGP_output_model[i] = get_quantiles(output_modelGP_samples[:,i], alpha = alpha)
-                                
-                        if self.dictionary[instrument]['GPDetrend']:
-                          
-                            self.model[instrument]['deterministic'], self.model[instrument]['GP'] = mDET_output_model, mGP_output_model
-                            self.model[instrument]['deterministic_uerror'], self.model[instrument]['GP_uerror'] = uDET_output_model, uGP_output_model
-                            self.model[instrument]['deterministic_lerror'], self.model[instrument]['GP_lerror'] = lDET_output_model, lGP_output_model
-
-                else:
-                    output_model = np.nanmedian(output_model_samples, axis=0)
-                    if self.global_model:
-                        if self.dictionary['global_model']['GPDetrend']:
-                            self.model['deterministic'], self.model['GP'] = np.nanmedian(output_modelDET_samples,axis=0), \
-                                                                            np.nanmedian(output_modelGP_samples,axis=0)
-                    else:
-                        if self.dictionary[instrument]['GPDetrend']:
-                            self.model[instrument]['deterministic'], self.model[instrument]['GP'] = np.nanmedian(output_modelDET_samples,axis=0), \
-                                                                                          np.nanmedian(output_modelGP_samples,axis=0)
-
-                # If return_components is true, generate the median models for each part of the full model:
-                if return_components:
-
-                    if self.modeltype == 'lc':
-                      
-                        if self.global_model:
-                          
-                            for k in components.keys():
-                                for ginstrument in instruments:
-                                    components[k][ginstrument] = np.median(components[k][ginstrument],axis=0)
-                                    
-                        else:
-                          
-                            for k in components.keys():
-                                components[k] = np.median(components[k],axis=0)
-                    else:
-                      
-                        for i in self.numbering:
-                            components['p'+str(i)] = np.median(components['p'+str(i)], axis = 0)
-                            
-                        components['trend'] = np.median(components['trend'], axis = 0)
-                        components['keplerian'] = np.median(components['keplerian'], axis = 0)
-
-                        if self.global_model:
-                            for ginstrument in instruments:
-                                components['mu'][ginstrument] = np.median(components['mu'][ginstrument])
-
-                        else:
-                            components['mu'] = np.median(components['mu'],
-                                                             axis=0)
-            else:
-              
-                if self.modeltype == 'lc':
-                    self.generate_lc_model(parameter_values, evaluate_lc=True)
-                else:
-                    self.generate_rv_model(parameter_values)
-
-                if self.global_model:
-                    self.residuals = self.y - self.model['global']
-                    self.variances = self.model['global_variances']
-                    if self.dictionary['global_model']['GPDetrend']:
-                        self.model['deterministic'], self.model[
-                            'GP'], output_model = self.get_GP_plus_deterministic_model(
-                                parameter_values)
-                    else:
-                        output_model = self.get_GP_plus_deterministic_model(
-                            parameter_values)
-                    if return_components:
-                        if self.modeltype == 'lc':
-                            for ginstrument in instruments:
-                                transit = 0.
-                                for i in self.numbering:
-                                    components['p' + str(i)][
-                                        ginstrument] = self.model[ginstrument][
-                                            'p' + str(i)]
-                                    transit += (
-                                        components['p' + str(i)][ginstrument] -
-                                        1.)
-                                components['transit'][
-                                    ginstrument] = 1. + transit
-                        else:
-                            for i in self.numbering:
-                                components['p' + str(i)] = self.model['p' +
-                                                                      str(i)]
-                            components['trend'] = self.model[
-                                'Keplerian+Trend'] - self.model['Keplerian']
-                            components['keplerian'] = self.model['Keplerian']
-                            for ginstrument in instruments:
-                                components['mu'][
-                                    ginstrument] = parameter_values['mu_' +
-                                                                    instrument]
-                        for ginstrument in instruments:
-                            if self.lm_boolean[ginstrument]:
-                                components['lm'][ginstrument] = self.model[
-                                    ginstrument]['LM']
-                else:
-                    self.residuals = self.data[instrument] - self.model[
-                        instrument]['deterministic']
-                    if self.dictionary[instrument]['GPDetrend']:
-                        self.model['deterministic'], self.model[
-                            'GP'], output_model = self.get_GP_plus_deterministic_model(
-                                parameter_values, instrument=instrument)
-                    else:
-                        output_model = self.get_GP_plus_deterministic_model(
-                            parameter_values, instrument=instrument)
-                    if return_components:
-                        if self.modeltype == 'lc':
-
-                            transit = 0.
-                            for i in self.numbering:
-                                components['p' +
-                                           str(i)] = self.model[instrument][
-                                               'p' + str(i)]
-                                transit += (components['p' + str(i)] - 1.)
-                            components['transit'] = 1. + transit
-                        else:
-                            for i in self.numbering:
-                                components['p' + str(i)] = self.model['p' +
-                                                                      str(i)]
-                            components['trend'] = self.model[
-                                'Keplerian+Trend'] - self.model['Keplerian']
-                            components['keplerian'] = self.model['Keplerian']
-                            components['mu'] = parameter_values['mu_' +
-                                                                instrument]
-                        if self.lm_boolean[instrument]:
-                            components['lm'] = self.model[instrument]['LM']
+                components = jax.tree.map(lambda x: np.median(x, axis=0), results['components'])
         else:
+            result = jax.tree.map(np.asarray, jax.jit(single)(self._parameter_dictionary(
+                {p: parameter_values[p] for p in input_parameters})))
+            output_model = result['model']
+            if 'GP' in result:
+                self.model['deterministic'], self.model['GP'] = result['deterministic'], result['GP']
+            if return_components:
+                components = result['components']
 
-            x = self.evaluate_model(instrument = instrument, parameter_values = self.posteriors, all_samples = all_samples,
-                                              nsamples = nsamples, return_samples = return_samples, t = t, GPregressors = GPregressors,
-                                              LMregressors = LMregressors, return_err = return_err, return_components = return_components, alpha = alpha,
-                                              evaluate_transit = evaluate_transit)
-            
-            if return_samples:
-                if return_err:
-                    if return_components:
-                        output_model_samples, m_output_model, u_output_model, l_output_model, components = x
-                    else:
-                        output_model_samples, m_output_model, u_output_model, l_output_model = x
-                else:
-                    if return_components:
-                        output_model_samples, output_model, components = x
-                    else:
-                        output_model_samples, output_model = x
+        if return_components:
+            # Non-global models return the components of the requested instrument; global models one dictionary per instrument:
+            if not self.global_model:
+                components = components[instrument]
             else:
-                if return_err:
-                    if return_components:
-                        m_output_model, u_output_model, l_output_model, components = x
-                    else:
-                        m_output_model, u_output_model, l_output_model = x
-                else:
-                    if return_components:
-                        output_model, components = x
-                    else:
-                        output_model = x
-
-        if not self.global_model:
-
-            # Return original inames back in case of non-global models:
-            self.inames = original_inames
-
-        else:
-                
-            if t is not None and self.dictionary['global_model']['GPDetrend']:
-            
-                # Return GP regressors back:
-                self.dictionary['global_model']['noise_model'].X = self.original_GPregressors
-
-        if evaluate_transit:
-            # Turn LM and GPs back on:
-            self.lm_boolean[instrument] = true_lm_boolean
-            if self.global_model:
-                self.dictionary['global_model']['GPDetrend'] = true_gp_boolean
-            else:
-                self.dictionary[instrument]['GPDetrend'] = true_gp_boolean
+                components = {k: {ginstrument: components[ginstrument][k] for ginstrument in components}
+                              for k in components[self.inames[0]]}
 
         if return_samples:
             if return_err:
@@ -3519,1102 +2702,6 @@ class model(object):
                 else:
                     return output_model
 
-    def generate_lc_model(self,
-                          parameter_values,
-                          evaluate_global_errors=True,
-                          evaluate_lc=False):
-
-        self.modelOK = True
-
-        # If TTV parametrization is 'T' for planet i, store transit times. Check only if the noTflag is False (which implies
-        # at least one planet uses the T-parametrization):
-        if self.Tflag:
-
-            planet_t0, planet_P = {}, {}
-            all_Ts, all_ns = {}, {}
-
-            for i in self.numbering:
-
-                if self.Tparametrization[i]:
-
-                    all_Ts[i], all_ns[i] = np.array([]), np.array([])
-
-                    for instrument in self.inames:
-
-                        for transit_number in self.dictionary[instrument][
-                                'TTVs'][int(i)]['transit_number']:
-
-                            all_Ts[i] = np.append(
-                                all_Ts[i],
-                                parameter_values['T_p' + str(i) + '_' +
-                                                 instrument + '_' +
-                                                 str(transit_number)])
-
-                            all_ns[i] = np.append(all_ns[i], transit_number)
-
-                    # If evaluate_lc flag is on, this means user is evaluating lightcurve. Here we do some tricks as to only evaluate
-                    # models in the user-defined instrument (to speed up evaluation), so in that case we use the posterior t0 and P
-                    # actually taken from the T-samples:
-                    if not evaluate_lc:
-
-                        XY, Y, X, X2 = np.sum(
-                            all_Ts[i] * all_ns[i]) / self.N_TTVs[i], np.sum(
-                                all_Ts[i]) / self.N_TTVs[i], np.sum(
-                                    all_ns[i]) / self.N_TTVs[i], np.sum(
-                                        all_ns[i]**2) / self.N_TTVs[i]
-
-                        # Get slope:
-                        planet_P[i] = (XY - X * Y) / (X2 - (X**2))
-
-                        # Intercept:
-                        planet_t0[i] = Y - planet_P[i] * X
-
-                    else:
-
-                        planet_t0[i], planet_P[i] = parameter_values['t0_p'+str(i)], parameter_values['P_p'+str(i)]
-
-        # Start loop to populate the self.model[instrument]['deterministic_model'] array, which will host the complete lightcurve for a given
-        # instrument (including flux from all the planets). Do the for loop per instrument for the parameter extraction, so in the
-        # future we can do, e.g., wavelength-dependant rp/rs.
-        for instrument in self.inames:
-
-            # Set full array to ones by copying:
-            self.model[instrument]['M'] = np.copy(
-                self.model[instrument]['ones'])
-
-            # If transit fit is on, then model the transit lightcurve:
-            if self.dictionary[instrument]['TransitFit'] or self.dictionary[instrument]['EclipseFit'] or self.dictionary[instrument]['TranEclFit']:
-
-                # Extract and set the limb-darkening coefficients for the instrument:
-                if self.dictionary[instrument]['ldlaw'] != 'linear' and self.dictionary[instrument]['ldlaw'] != 'none':
-
-
-                    if self.dictionary[instrument]['ldparametrization'] == 'kipping2013':
-
-                        coeff1, coeff2 = reverse_ld_coeffs(self.dictionary[instrument]['ldlaw'],\
-                                                           parameter_values['q1_'+self.ld_iname[instrument]],\
-                                                           parameter_values['q2_'+self.ld_iname[instrument]])
-
-                    elif self.dictionary[instrument]['ldparametrization'] == 'normal':
-
-                        if self.dictionary[instrument]['ldlaw'] != 'nonlinear':
-
-                            coeff1, coeff2 = parameter_values['u1_'+self.ld_iname[instrument]], \
-                                             parameter_values['u2_'+self.ld_iname[instrument]]
-
-                        else:
-
-                            coeff1, coeff2, coeff3, coeff4 = parameter_values['c1_'+self.ld_iname[instrument]], \
-                                                             parameter_values['c2_'+self.ld_iname[instrument]], \
-                                                             parameter_values['c3_'+self.ld_iname[instrument]], \
-                                                             parameter_values['c4_'+self.ld_iname[instrument]]
-
-                elif self.dictionary[instrument]['ldlaw'] == 'none':
-
-                    coeff1, coeff2 = 0.1, 0.3
-
-                else:
-
-                    if self.dictionary[instrument]['ldparametrization'] == 'kipping2013':
-
-                        coeff1 = parameter_values['q1_' + self.ld_iname[instrument]]
-
-                    elif self.dictionary[instrument]['ldparametrization'] == 'normal':
-
-                        coeff1 = parameter_values['u1_' + self.ld_iname[instrument]]
-
-                # First (1) check if TTV mode is activated. If it is not, simply save the sampled planet periods and time-of transit centers for check
-                # in the next round of iteration (see below). If it is, depending on the parametrization, either shift the time-indexes accordingly (see below
-                # comments for details).
-                cP, ct0 = {}, {}
-
-                for i in self.numbering:
-
-                    # Check if we will be fitting for TTVs. If not, all goes as usual. If we are, check which parametrization (dt or T):
-                    if not self.dictionary[instrument]['TTVs'][i]['status']:
-
-                        t0, P = parameter_values[
-                            't0_p' + str(i)], parameter_values['P_p' + str(i)]
-
-                        cP[i], ct0[i] = P, t0
-
-                    else:
-
-                        # If TTVs is on for planet i, compute the expected time of transit, and shift it. For this, use information encoded in the prior
-                        # name; if, e.g., dt_p1_TESS1_-2, then n = -2 and the time of transit (with TTV) = t0 + n*P + dt_p1_TESS1_-2 in the case of the dt
-                        # parametrization. In the case of the T-parametrization, the time of transit with TTV would be T_p1_TESS1_-2, and the period and t0
-                        # will be derived from there from the least-squares slope and intercept, respectively, to the T's. Compute transit
-                        # model assuming that time-of-transit; repeat for all the transits. Generally users will not do TTV analyses, so set this latter
-                        # case to be the most common one by default in the if-statement:
-                        dummy_time = np.copy(self.times[instrument])
-
-                        if self.dictionary[instrument]['TTVs'][i][
-                                'parametrization'] == 'dt':
-
-                            t0, P = parameter_values[
-                                't0_p' + str(i)], parameter_values['P_p' +
-                                                                   str(i)]
-
-                            cP[i], ct0[i] = P, t0
-
-                            for transit_number in self.dictionary[instrument][
-                                    'TTVs'][int(i)]['transit_number']:
-
-                                transit_time = t0 + transit_number * P + parameter_values[
-                                    'dt_p' + str(i) + '_' + instrument + '_' +
-                                    str(transit_number)]
-
-                                # This implicitly sets maximum transit duration to P/2 days:
-                                idx = np.where(
-                                    np.abs(self.times[instrument] -
-                                           transit_time) < P / 4.)[0]
-
-                                dummy_time[idx] = self.times[instrument][
-                                    idx] - parameter_values['dt_p' + str(i) +
-                                                            '_' + instrument +
-                                                            '_' +
-                                                            str(transit_number)]
-
-                        else:
-
-                            t0, P = planet_t0[i], planet_P[i]
-
-                            for transit_number in self.dictionary[instrument][
-                                    'TTVs'][int(i)]['transit_number']:
-
-                                dt = parameter_values[
-                                    'T_p' + str(i) + '_' + instrument + '_' +
-                                    str(transit_number)] - (t0 +
-                                                            transit_number * P)
-
-                                # This implicitly sets maximum transit duration to P/2 days:
-                                idx = np.where(
-                                    np.abs(self.times[instrument] -
-                                           parameter_values[
-                                               'T_p' + str(i) + '_' +
-                                               instrument + '_' +
-                                               str(transit_number)]) < P /
-                                    4.)[0]
-
-                                dummy_time[
-                                    idx] = self.times[instrument][idx] - dt
-
-                            cP[i], ct0[i] = P, t0
-
-                # Whether there are TTVs or not, and before anything continues, check the periods are chronologically ordered (this is to avoid multiple modes
-                # due to periods "jumping" between planet numbering):
-                first_time = True
-                for i in self.numbering:
-
-                    if first_time:
-
-                        ccP = cP[i]  #parameter_values['P_p'+str(i)]
-                        first_time = False
-
-                    else:
-
-                        if ccP < cP[i]:  #parameter_values['P_p'+str(i)]:
-
-                            ccP = cP[i]  #parameter_values['P_p'+str(i)]
-
-                        else:
-
-                            self.modelOK = False
-                            return False
-
-                # Once all is OK with the periods and time-of-transit centers, loop through all the planets, getting the lightcurve model for each:
-                for i in self.numbering:
-
-                    P, t0 = cP[i], ct0[i]
-
-                    ### For instrument dependent eclipse depth:
-                    ### We only want to make eclipse depth instrument depended, not the time correction factor
-                    if self.dictionary[instrument]['EclipseFit'] or self.dictionary[instrument]['TranEclFit']:
-
-                        ## This try and except loop is needed because even though when eclipse fit or transit-eclipse fit is enabled
-                        ## it is possible that  there is no prior for fp -- this will happen when we fit Lambertian or kelp phase curve model
-                        ## In that case, we will define a dummy fp value
-                        try:
-                            fp = parameter_values['fp_p' + str(i) + self.fp_iname['p' + str(i)][instrument]]
-                        except:
-                            fp = 100e-6
-
-                        if self.dictionary[instrument]['PhaseCurveFit']:
-
-                            phase_offset = parameter_values['phaseoffset_p' + str(i) + self.phaseoffset_iname['p' + str(i)][instrument]]
-                        
-                        if self.dictionary[instrument]['CowanAgolPCFit']:
-
-                            C1_CA08 = parameter_values['C1_p' + str(i) + self.fp_iname['p' + str(i)][instrument]]
-                            D1_CA08 = parameter_values['D1_p' + str(i) + self.fp_iname['p' + str(i)][instrument]]
-                            C2_CA08 = parameter_values['C2_p' + str(i) + self.fp_iname['p' + str(i)][instrument]]
-                            D2_CA08 = parameter_values['D2_p' + str(i) + self.fp_iname['p' + str(i)][instrument]]
-
-                        if self.dictionary[instrument]['LambertPCFit']:
-
-                            Ag_Lambert = parameter_values['aglambert_p' + str(i) + self.aglambert_iname['p' + str(i)][instrument]]
-
-                        if self.dictionary[instrument]['KelpHomoPCFit']:
-
-                            w_singlescat = parameter_values['singlescat_p' + str(i) + self.kelphomo_iname['p' + str(i)][instrument]]
-                            g_scatasym = parameter_values['g_p' + str(i) + self.kelphomo_iname['p' + str(i)][instrument]]
-
-                        if self.dictionary[instrument]['KelpThmPCFit']:
-
-                            hotspot_off = parameter_values['hotspotoff_p' + str(i) + self.kelpthm_iname['p' + str(i)][instrument]]
-                            wdrag = parameter_values['wdrag_p' + str(i) + self.kelpthm_iname['p' + str(i)][instrument]]
-                            alpha_fluid = parameter_values['alpha_p' + str(i) + self.kelpthm_iname['p' + str(i)][instrument]]
-                            cml11 = parameter_values['cml11_p' + str(i) + self.kelpthm_iname['p' + str(i)][instrument]]
-                            fprime = parameter_values['fprime_p' + str(i) + self.kelpthm_iname['p' + str(i)][instrument]]
-
-                        if self.dictionary[instrument]['KelpInhomoPCFit']:
-
-                            w0 = parameter_values['w0_p' + str(i) + self.kelpinhomo_iname['p' + str(i)][instrument]]
-                            wp = parameter_values['wp_p' + str(i) + self.kelpinhomo_iname['p' + str(i)][instrument]]
-                            
-                            try:
-                                x1 = parameter_values['x1_p' + str(i) + self.kelpinhomo_iname['p' + str(i)][instrument]]
-                                x2 = parameter_values['x2_p' + str(i) + self.kelpinhomo_iname['p' + str(i)][instrument]]
-                            except:
-                                # x1 and x2 are not provided, that means we are using x1' and x2' instead
-                                # They are defined as follows: x1' = sin(x1), x2' = sin(x2), i.e., x1 = arcsin(x1'), x2 = arcsin(x2') (from Morris et al. 2024)
-                                x1prime = parameter_values['x1prime_p' + str(i) + self.kelpinhomo_iname['p' + str(i)][instrument]]
-                                x2prime = parameter_values['x2prime_p' + str(i) + self.kelpinhomo_iname['p' + str(i)][instrument]]
-
-                                # Converting back to x1 and x2
-                                x1 = np.rad2deg( np.arcsin( x1prime ) )
-                                x2 = np.rad2deg( np.arcsin( x2prime ) )
-
-                            agkelp = parameter_values['agkelp_p' + str(i) + self.kelpinhomo_iname['p' + str(i)][instrument]]
-
-                        if not self.light_travel_delay:
-
-                            t_secondary = parameter_values['t_secondary_p' + str(i)]
-
-                    if self.dictionary['efficient_bp'][i]:
-                        if not self.dictionary['fitrho']:
-                            a,r1,r2   = parameter_values['a_p'+str(i)], parameter_values['r1_p'+str(i)],\
-                                        parameter_values['r2_p'+str(i)]
-                        else:
-                            rho,r1,r2 = parameter_values['rho'], parameter_values['r1_p'+str(i)],\
-                                        parameter_values['r2_p'+str(i)]
-                            a = ((rho * G * ((P * 24. * 3600.)**2)) /
-                                 (3. * np.pi))**(1. / 3.)
-                        if r1 > self.Ar:
-                            b,p = (1+self.pl)*(1. + (r1-1.)/(1.-self.Ar)),\
-                                  (1-r2)*self.pl + r2*self.pu
-                        else:
-                            b,p = (1. + self.pl) + np.sqrt(r1/self.Ar)*r2*(self.pu-self.pl),\
-                                  self.pu + (self.pl-self.pu)*np.sqrt(r1/self.Ar)*(1.-r2)
-                    else:
-                        if not self.dictionary['fitrho']:
-                            if not self.dictionary[instrument][
-                                    'TransitFitCatwoman']:
-                                a,b,p = parameter_values['a_p'+str(i)], parameter_values['b_p'+str(i)],\
-                                        parameter_values['p_p'+str(i) + self.p_iname['p' + str(i)][instrument]]
-                            else:
-
-                                a,b,p1,p2,phi = parameter_values['a_p'+str(i)], parameter_values['b_p'+str(i)],\
-                                             parameter_values['p1_p'+str(i) + self.p1_iname['p' + str(i)][instrument]], \
-                                             parameter_values['p2_p'+str(i) + self.p1_iname['p' + str(i)][instrument]], \
-                                             parameter_values['phi_p'+str(i)]
-
-                                p = np.min([p1, p2])
-
-                        else:
-
-                            if not self.dictionary[instrument][
-                                    'TransitFitCatwoman']:
-
-                                rho,b,p = parameter_values['rho'], parameter_values['b_p'+str(i)],\
-                                          parameter_values['p_p'+str(i) + self.p_iname['p' + str(i)][instrument]]
-
-                            else:
-
-                                rho,b,p1,p2,phi = parameter_values['rho'], parameter_values['b_p'+str(i)],\
-                                               parameter_values['p1_p'+str(i) + self.p1_iname['p' + str(i)][instrument]], \
-                                               parameter_values['p2_p'+str(i) + self.p1_iname['p' + str(i)][instrument]],\
-                                               parameter_values['phi_p'+str(i)]
-
-                                p = np.min([p1, p2])
-
-                            a = ((rho * G * ((P * 24. * 3600.)**2)) /
-                                 (3. * np.pi))**(1. / 3.)
-
-                    # Now extract eccentricity and omega depending on the used parametrization for each planet:
-                    if self.dictionary['ecc_parametrization'][i] == 0:
-                        ecc, omega = parameter_values[
-                            'ecc_p' + str(i)], parameter_values['omega_p' +
-                                                                str(i)]
-                    elif self.dictionary['ecc_parametrization'][i] == 1:
-                        ecc = np.sqrt(
-                            parameter_values['ecosomega_p' + str(i)]**2 +
-                            parameter_values['esinomega_p' + str(i)]**2)
-                        omega = np.arctan2(
-                            parameter_values['esinomega_p' + str(i)],
-                            parameter_values['ecosomega_p' +
-                                             str(i)]) * 180. / np.pi
-                    else:
-                        ecc = parameter_values['secosomega_p' +
-                                               str(i)]**2 + parameter_values[
-                                                   'sesinomega_p' + str(i)]**2
-                        omega = np.arctan2(
-                            parameter_values['sesinomega_p' + str(i)],
-                            parameter_values['secosomega_p' +
-                                             str(i)]) * 180. / np.pi
-
-                    # Generate lightcurve for the current planet if ecc is OK:
-                    if ecc > self.ecclim:
-
-                        self.modelOK = False
-                        return False
-
-                    else:
-
-                        ecc_factor = (1. + ecc * np.sin(omega * np.pi / 180.)
-                                     ) / (1. - ecc**2)
-                        inc_inv_factor = (b / a) * ecc_factor
-
-                        if not (b > 1. + p or inc_inv_factor >= 1.):
-
-                            self.model[instrument]['params'].t0 = t0
-                            self.model[instrument]['params'].per = P
-                            self.model[instrument]['params'].a = a
-
-                            self.model[instrument]['params'].inc = np.arccos(inc_inv_factor)*180./np.pi
-                            self.model[instrument]['params'].ecc = ecc
-                            self.model[instrument]['params'].w = omega
-
-                            if self.dictionary[instrument]['EclipseFit'] or self.dictionary[instrument]['TranEclFit']:
-
-                                self.model[instrument]['params'].fp = fp
-
-                                if not self.light_travel_delay:
-
-                                    self.model[instrument]['params'].t_secondary = t_secondary
-
-                                else:
-
-                                    # If light-travel time is activated, self-consistently calculate time of secondary eclipse:
-                                    self.model[instrument]['params'].Rs = self.stellar_radius
-
-                                    if self.dictionary[instrument]['EclipseFit']:
-
-                                        self.model[instrument]['params'].t_secondary = self.model[instrument]['m'].get_t_secondary(self.model[instrument]['params'])
-
-                                    elif self.dictionary[instrument]['TranEclFit']:
-
-                                        self.model[instrument]['params'].t_secondary = self.model[instrument]['m'][1].get_t_secondary(self.model[instrument]['params'])
-
-                                    # Get time-delayed times:
-                                    corrected_t = correct_light_travel_time(self.times[instrument], self.model[instrument]['params'])
-
-                                    # Dynamically modify the batman model for the eclipse part:
-                                    if self.dictionary[instrument]['EclipseFit']:
-
-                                        if self.dictionary[instrument]['resampling']:
-
-                                            _, [_, self.model[instrument]['m']] = init_batman(corrected_t, self.dictionary[instrument]['ldlaw'], \
-                                                                                         nresampling = self.dictionary[instrument]['nresampling'], \
-                                                                                         etresampling = self.dictionary[instrument]['exptimeresampling'])
-
-                                        else:
-
-                                            _, [_, self.model[instrument]['m']] = init_batman(corrected_t, self.dictionary[instrument]['ldlaw'])
-
-                                    elif self.dictionary[instrument]['TranEclFit']:
-
-                                        if self.dictionary[instrument]['resampling']:
-
-                                            _, [_, self.model[instrument]['m'][1]] = init_batman(corrected_t, self.dictionary[instrument]['ldlaw'], \
-                                                                                         nresampling = self.dictionary[instrument]['nresampling'], \
-                                                                                         etresampling = self.dictionary[instrument]['exptimeresampling'])
-
-                                        else:
-
-                                            _, [_, self.model[instrument]['m'][1]] = init_batman(corrected_t, self.dictionary[instrument]['ldlaw'])
-
-
-                            if not self.dictionary[instrument]['TransitFitCatwoman']:
-
-                                self.model[instrument]['params'].rp = p
-                                
-                            else:
-                              
-                                self.model[instrument]['params'].rp = p1
-                                self.model[instrument]['params'].rp2 = p2
-                                self.model[instrument]['params'].phi = phi
-                                
-                            if self.dictionary[instrument]['ldlaw'] == 'nonlinear':
-
-                                self.model[instrument]['params'].u = [ coeff1, coeff2, coeff3, coeff4 ]
-
-                            elif self.dictionary[instrument]['ldlaw'] == 'linear':
-
-                                self.model[instrument]['params'].u = [coeff1]
-
-                            else:
-                              
-                                self.model[instrument]['params'].u = [ coeff1, coeff2 ]
-
-                            # If TTVs is on for planet i, compute the expected time of transit, and shift it. For this, use information encoded in the prior
-                            # name; if, e.g., dt_p1_TESS1_-2, then n = -2 and the time of transit (with TTV) = t0 + n*P + dt_p1_TESS1_-2. Compute transit
-                            # model assuming that time-of-transit; repeat for all the transits. Generally users will not do TTV analyses, so set this latter
-                            # case to be the most common one by default in the if-statement:
-
-                            if not self.dictionary[instrument]['TTVs'][i][
-                                    'status']:
-
-                                # If log_like_calc is True (by default during juliet.fit), don't bother saving the lightcurve of planet p_i:
-
-                                if self.log_like_calc:
-
-                                    if not self.dictionary[instrument]['TranEclFit']:
-
-                                        self.model[instrument]['M'] += self.model[instrument]['m'].light_curve(self.model[instrument]['params']) - 1.
-
-                                    else:
-
-                                        # In combined transit + eclipse models, assume either (a) by default any phase-curve variations are being modelled externally 
-                                        # (by, e.g., systematics models, phase-curve variations added later, etc.). To this end, note batman has out-of-eclipse 
-                                        # model variations 1 + fp --- with in-eclipse always being 1. Subtract fp then::
-                                        transit_model = self.model[instrument]['m'][0].light_curve(self.model[instrument]['params'])
-                                        eclipse_model = self.model[instrument]['m'][1].light_curve(self.model[instrument]['params']) 
-
-                                        # Now, figure out if a phase-curve model is being fit or not:
-                                        if (not self.dictionary[instrument]['PhaseCurveFit']) and (not self.dictionary[instrument]['CowanAgolPCFit']) and (not self.dictionary[instrument]['LambertPCFit']) and ( not self.dictionary[instrument]['KelpHomoPCFit'] ) and (not self.dictionary[instrument]['KelpThmPCFit']) and (not self.dictionary[instrument]['KelpInhomoPCFit']):
-
-                                            eclipse_model = eclipse_model - self.model[instrument]['params'].fp
-                                            self.model[instrument]['M'] += transit_model * eclipse_model - 1.
-
-                                        else:
-
-                                            # We are creating one more variable, called phase_curve_model, and defining it outside of this if/else loop
-                                            # This is because if there are more than one phase curve models (e.g., reflected + thermal), we can add them
-
-                                            phase_curve_model = np.zeros( len( self.model[instrument]['m'][1].t ) )
-
-                                            if self.dictionary[instrument]['PhaseCurveFit']:
-
-                                                orbital_phase = ( ( ( self.model[instrument]['m'][1].t - self.model[instrument]['params'].t0 ) / self.model[instrument]['params'].per ) % 1 )
-                                                center_phase = - np.pi / 2.
-
-                                                # Build model. First, the basis sine function:
-                                                sine_model = np.sin(2. * np.pi * (orbital_phase) + center_phase + phase_offset * (np.pi / 180.) )
-                                                # Scale to be 1 at secondary eclipse, 0 at transit:
-                                                sine_model = (sine_model + 1) * 0.5
-                                                # Amplify by phase-amplitude:
-                                                sine_model = (self.model[instrument]['params'].fp) * sine_model
-                                                
-                                                phase_curve_model = phase_curve_model + sine_model
-                                                # Multiply by normed eclipse model: (we will do this outside of if/else loop) 
-                                                #sine_model = 1. + sine_model * ((eclipse_model - 1.) / self.model[instrument]['params'].fp)
-
-                                            if self.dictionary[instrument]['CowanAgolPCFit']:
-
-                                                # Computing (sort of phase: I am following Zhang et al. 2024)
-                                                omega_t = 2 * np.pi * (self.model[instrument]['m'][1].t - self.model[instrument]['params'].t_secondary) / self.model[instrument]['params'].per
-
-                                                # 2nd order Phase curve model: Fp + C1*cos(wt) - C1 + D1*sin(wt) + C2*cos(2wt) - C2 + D2*sin(2wt)
-                                                pc_CA08 = self.model[instrument]['params'].fp + ( C1_CA08 * (np.cos( omega_t ) - 1.) ) + ( D1_CA08 * np.sin( omega_t ) ) + ( C2_CA08 * (np.cos( 2*omega_t ) - 1.) ) + ( D2_CA08 * np.sin( 2*omega_t ) )
-
-                                                phase_curve_model = phase_curve_model + pc_CA08
-
-                                                # And multiplying the PC model with the occultation model (we will do this outside of if/else loop)
-                                                #sine_model = 1. + pc_CA08 * ((eclipse_model - 1.) / self.model[instrument]['params'].fp)
-
-                                            if self.dictionary[instrument]['LambertPCFit']:
-
-                                                # The Lambertian model is from Deline et al. (2022); see their Section 4.4.3.
-
-                                                ## First we need to find true anomaly
-                                                true_anomaly = self.model[instrument]['m'][1].get_true_anomaly()
-
-                                                # Now computing alpha
-                                                alpha_phs = np.arccos( -np.sin( np.radians(self.model[instrument]['m'][1].w) + true_anomaly ) * np.sin( np.radians( self.model[instrument]['m'][1].inc ) ) )
-
-                                                # Eccentricity factor
-                                                ecc_facs = ( 1 + self.model[instrument]['m'][1].ecc * np.cos( true_anomaly ) ) / ( 1 - self.model[instrument]['m'][1].ecc**2 )
-
-                                                lambert_model = Ag_Lambert * ( self.model[instrument]['m'][1].rp * ecc_facs / self.model[instrument]['m'][1].a )**2 * ( np.sin(alpha_phs) + (np.pi - alpha_phs)*np.cos(alpha_phs) ) / np.pi
-
-                                                # Finally, adding Lambert model to the phase curve model
-                                                phase_curve_model = phase_curve_model + lambert_model
-
-                                            if self.dictionary[instrument]['KelpHomoPCFit']:
-
-                                                kelp_homo_refl_pc = kelp_homogeneous_refl_pc_model(times=self.model[instrument]['m'][1].t,\
-                                                                                                   t0=self.model[instrument]['params'].t0,\
-                                                                                                   per=self.model[instrument]['params'].per,\
-                                                                                                   ar=self.model[instrument]['params'].a,\
-                                                                                                   rprs=self.model[instrument]['params'].rp,\
-                                                                                                   g=g_scatasym, single_scat_albedo=w_singlescat,\
-                                                                                                   nknots=self.kelp_refl_interpolation_knots)
-                                                
-                                                # Finally, adding this model to the phase curve model
-                                                phase_curve_model = phase_curve_model + kelp_homo_refl_pc
-
-                                            if self.dictionary[instrument]['KelpThmPCFit']:
-
-                                                kelp_thm_pc = kelp_thermal_pc_model(times=self.model[instrument]['m'][1].t,\
-                                                                                    t0=self.model[instrument]['params'].t0,\
-                                                                                    per=self.model[instrument]['params'].per,\
-                                                                                    ar=self.model[instrument]['params'].a,\
-                                                                                    rprs=self.model[instrument]['params'].rp,\
-                                                                                    filter_wavelength=self.kelp_filt_wav[instrument],\
-                                                                                    filter_transmittance=self.kelp_filt_trans[instrument],\
-                                                                                    hotspot_offset=hotspot_off, c11=cml11, fprime=fprime,\
-                                                                                    alpha=alpha_fluid, omega_drag=wdrag, Teff=self.stellar_teff,\
-                                                                                    ntheta=self.kelp_ntheta, nphi=self.kelp_nphi,\
-                                                                                    nknots=self.kelp_thm_interpolation_knots)
-                                                
-                                                # Finally, adding this model to the phase curve model
-                                                phase_curve_model = phase_curve_model + kelp_thm_pc
-
-                                            if self.dictionary[instrument]['KelpInhomoPCFit']:
-
-                                                kelp_inhomorefl_pc = kelp_inhomogeneous_refl_pc_model(times=self.model[instrument]['m'][1].t,\
-                                                                                                      t0=self.model[instrument]['params'].t0,\
-                                                                                                      per=self.model[instrument]['params'].per,\
-                                                                                                      ar=self.model[instrument]['params'].a,\
-                                                                                                      rprs=self.model[instrument]['params'].rp,\
-                                                                                                      w0=w0, wp=wp, Ag=agkelp, x1=x1, x2=x2,\
-                                                                                                      nknots=self.kelp_refl_interpolation_knots)
-                                                
-                                                #print('___ +++: ', type(kelp_inhomorefl_pc))
-                                                #print('>>> ---: ', np.where(np.isnan(kelp_inhomorefl_pc)))
-                                                #if len( np.where(np.isnan(kelp_inhomorefl_pc))[0] ) != 0:
-                                                #    print('---+++---: w0, wp, agkelp, x1, x2: ', w0, wp, agkelp, x1, x2)
-
-                                                # Finally, adding this model to the total phase curve model
-                                                phase_curve_model = phase_curve_model + kelp_inhomorefl_pc
-
-
-                                            # Now, we will compute the full phase curve model (by takeing the phase curve model and multiplying it with normalised occultation model)
-                                            phase_curve_model = 1 + phase_curve_model * ((eclipse_model - 1.) / self.model[instrument]['params'].fp)
-                                            
-                                            # And get all together:
-                                            self.model[instrument]['M'] += transit_model * phase_curve_model - 1.
-
-                                else:
-
-                                    if not self.dictionary[instrument]['TranEclFit']:
-
-                                        self.model[instrument]['p'+str(i)] = self.model[instrument]['m'].light_curve(self.model[instrument]['params'])
-                                        self.model[instrument]['M'] += self.model[instrument]['p'+str(i)] - 1.
-
-                                    else:
-
-                                        # In combined transit + eclipse models, assume by default any phase-curve variations are being modelled externally 
-                                        # by default (by, e.g., systematics models, phase-curve variations added later, etc.). To this end, note batman has out-of-eclipse 
-                                        # model variations 1 + fp --- with in-eclipse always being 1. Subtract fp then::
-                                        transit_model = self.model[instrument]['m'][0].light_curve(self.model[instrument]['params'])
-                                        eclipse_model = self.model[instrument]['m'][1].light_curve(self.model[instrument]['params']) 
-
-                                        # Now, figure out if a phase-curve model is being fit or not:
-                                        if (not self.dictionary[instrument]['PhaseCurveFit']) and (not self.dictionary[instrument]['CowanAgolPCFit']) and (not self.dictionary[instrument]['LambertPCFit']) and (not self.dictionary[instrument]['KelpHomoPCFit']) and (not self.dictionary[instrument]['KelpThmPCFit']) and (not self.dictionary[instrument]['KelpInhomoPCFit']):
-
-                                            eclipse_model = eclipse_model - self.model[instrument]['params'].fp
-                                            self.model[instrument]['p'+str(i)] = transit_model * eclipse_model
-
-                                        else:
-
-                                            # We are creating one more variable, called phase_curve_model, and defining it outside of this if/else loop
-                                            # This is because if there are more than one phase curve models (e.g., reflected + thermal), we can add them
-                                            
-                                            phase_curve_model = np.zeros( len( self.model[instrument]['m'][1].t ) )
-
-                                            if self.dictionary[instrument]['PhaseCurveFit']:
-
-                                                orbital_phase = ( ( ( self.model[instrument]['m'][1].t - self.model[instrument]['params'].t0 ) / self.model[instrument]['params'].per ) % 1 )
-                                                center_phase = - np.pi / 2.
-
-                                                # Build model. First, the basis sine function:
-                                                sine_model = np.sin(2. * np.pi * (orbital_phase) + center_phase + phase_offset * (np.pi / 180.) )
-                                                # Scale to be 1 at secondary eclipse, 0 at transit:
-                                                sine_model = (sine_model + 1) * 0.5
-                                                # Amplify by phase-amplitude:
-                                                sine_model = (self.model[instrument]['params'].fp) * sine_model
-                                                
-                                                # Adding the sine model to the full phase curve model
-                                                phase_curve_model = phase_curve_model + sine_model
-
-                                                # Multiply by normed eclipse model (again, we will do this outside of if/else loop since we may want to add more than one phase curve models):
-                                                #sine_model = 1. + sine_model * ((eclipse_model - 1.) / self.model[instrument]['params'].fp)
-
-                                            if self.dictionary[instrument]['CowanAgolPCFit']:
-
-                                                # Computing (sort of phase: I am following Zhang et al. 2024)
-                                                omega_t = 2 * np.pi * (self.model[instrument]['m'][1].t - self.model[instrument]['params'].t_secondary) / self.model[instrument]['params'].per
-
-                                                # 2nd order Phase curve model: Fp + C1*cos(wt) - C1 + D1*sin(wt) + C2*cos(2wt) - C2 + D2*sin(2wt)
-                                                pc_CA08 = self.model[instrument]['params'].fp + ( C1_CA08 * (np.cos( omega_t ) - 1.) ) + ( D1_CA08 * np.sin( omega_t ) ) + ( C2_CA08 * (np.cos( 2*omega_t ) - 1.) ) + ( D2_CA08 * np.sin( 2*omega_t ) )
-
-                                                # Adding the pc_CA08 model to the full phase curve model
-                                                phase_curve_model = phase_curve_model + pc_CA08
-
-                                                # And multiplying the PC model with the occultation model (we will do this outside of this if/else loop)
-                                                #sine_model = 1. + pc_CA08 * ((eclipse_model - 1.) / self.model[instrument]['params'].fp)
-
-                                            if self.dictionary[instrument]['LambertPCFit']:
-
-                                                # The Lambertian model is from Deline et al. (2022); see their Section 4.4.3.
-
-                                                ## First we need to find true anomaly
-                                                true_anomaly = self.model[instrument]['m'][1].get_true_anomaly()
-
-                                                # Now computing alpha
-                                                alpha_phs = np.arccos( -np.sin( np.radians(self.model[instrument]['m'][1].w) + true_anomaly ) * np.sin( np.radians( self.model[instrument]['m'][1].inc ) ) )
-
-                                                # Eccentricity factor
-                                                ecc_facs = ( 1 + self.model[instrument]['m'][1].ecc * np.cos( true_anomaly ) ) / ( 1 - self.model[instrument]['m'][1].ecc**2 )
-
-                                                lambert_model = Ag_Lambert * ( self.model[instrument]['m'][1].rp * ecc_facs / self.model[instrument]['m'][1].a )**2 * ( np.sin(alpha_phs) + (np.pi - alpha_phs)*np.cos(alpha_phs) ) / np.pi
-
-                                                # Finally, adding Lambert model to the phase curve model
-                                                phase_curve_model = phase_curve_model + lambert_model
-
-                                            if self.dictionary[instrument]['KelpHomoPCFit']:
-
-                                                kelp_homo_refl_pc = kelp_homogeneous_refl_pc_model(times=self.model[instrument]['m'][1].t,\
-                                                                                                   t0=self.model[instrument]['params'].t0,\
-                                                                                                   per=self.model[instrument]['params'].per,\
-                                                                                                   ar=self.model[instrument]['params'].a,\
-                                                                                                   rprs=self.model[instrument]['params'].rp,\
-                                                                                                   g=g_scatasym, single_scat_albedo=w_singlescat,\
-                                                                                                   nknots=self.kelp_refl_interpolation_knots)
-                                                
-                                                # Finally, adding this model to the phase curve model
-                                                phase_curve_model = phase_curve_model + kelp_homo_refl_pc
-
-                                            if self.dictionary[instrument]['KelpThmPCFit']:
-
-                                                kelp_thm_pc = kelp_thermal_pc_model(times=self.model[instrument]['m'][1].t,\
-                                                                                    t0=self.model[instrument]['params'].t0,\
-                                                                                    per=self.model[instrument]['params'].per,\
-                                                                                    ar=self.model[instrument]['params'].a,\
-                                                                                    rprs=self.model[instrument]['params'].rp,\
-                                                                                    filter_wavelength=self.kelp_filt_wav[instrument],\
-                                                                                    filter_transmittance=self.kelp_filt_trans[instrument],\
-                                                                                    hotspot_offset=hotspot_off, c11=cml11, fprime=fprime,\
-                                                                                    alpha=alpha_fluid, omega_drag=wdrag, Teff=self.stellar_teff,\
-                                                                                    ntheta=self.kelp_ntheta, nphi=self.kelp_nphi,\
-                                                                                    nknots=self.kelp_thm_interpolation_knots)
-                                                
-                                                # Finally, adding this model to the phase curve model
-                                                phase_curve_model = phase_curve_model + kelp_thm_pc
-
-                                            if self.dictionary[instrument]['KelpInhomoPCFit']:
-
-                                                kelp_inhomorefl_pc = kelp_inhomogeneous_refl_pc_model(times=self.model[instrument]['m'][1].t,\
-                                                                                                      t0=self.model[instrument]['params'].t0,\
-                                                                                                      per=self.model[instrument]['params'].per,\
-                                                                                                      ar=self.model[instrument]['params'].a,\
-                                                                                                      rprs=self.model[instrument]['params'].rp,\
-                                                                                                      w0=w0, wp=wp, Ag=agkelp, x1=x1, x2=x2,\
-                                                                                                      nknots=self.kelp_refl_interpolation_knots)
-                                                
-                                                # Finally, adding this model to the total phase curve model
-                                                phase_curve_model = phase_curve_model + kelp_inhomorefl_pc
-
-                                            # Multiplying occultation model to the full phase curve model
-                                            phase_curve_model = 1. + phase_curve_model * ((eclipse_model - 1.) / self.model[instrument]['params'].fp)
-
-                                            self.model[instrument]['p'+str(i)] = transit_model * phase_curve_model
-
-                                        self.model[instrument]['M'] += self.model[instrument]['p'+str(i)] - 1.
-
-                            else:
-
-                                if not self.dictionary[instrument]['TransitFitCatwoman']:
-                                    if self.dictionary[instrument]['resampling']:
-                                        if self.dictionary[instrument]['TransitFit']:
-                                            pm, [m,_] = init_batman(dummy_time, self.dictionary[instrument]['ldlaw'], \
-                                                                    nresampling = self.dictionary[instrument]['nresampling'], \
-                                                                    etresampling = self.dictionary[instrument]['exptimeresampling'])
-                                        elif self.dictionary[instrument]['EclipseFit']:
-                                            pm, [_,m] = init_batman(dummy_time, self.dictionary[instrument]['ldlaw'],\
-                                                                    nresampling = self.dictionary[instrument]['nresampling'], \
-                                                                    etresampling = self.dictionary[instrument]['exptimeresampling'])
-                                        elif self.dictionary[instrument]['TranEclFit']:
-                                            pm, m = init_batman(dummy_time, self.dictionary[instrument]['ldlaw'],\
-                                                                    nresampling = self.dictionary[instrument]['nresampling'], \
-                                                                    etresampling = self.dictionary[instrument]['exptimeresampling'])
-                                    else:
-                                        if self.dictionary[instrument]['TransitFit']:
-                                            pm, [m,_] = init_batman(dummy_time, self.dictionary[instrument]['ldlaw'])
-                                        elif self.dictionary[instrument]['EclipseFit']:
-                                            pm, [_,m] = init_batman(dummy_time, self.dictionary[instrument]['ldlaw'])
-                                        elif self.dictionary[instrument]['TranEclFit']:
-                                            pm, m = init_batman(dummy_time, self.dictionary[instrument]['ldlaw'])
-
-                                else:
-                                    if self.dictionary[instrument][
-                                            'resampling']:
-                                        pm, m = init_catwoman(dummy_time, self.dictionary[instrument]['ldlaw'], \
-                                                                 nresampling = self.dictionary[instrument]['nresampling'], \
-                                                                 etresampling = self.dictionary[instrument]['exptimeresampling'])
-                                    else:
-                                        pm, m = init_catwoman(
-                                            dummy_time,
-                                            self.dictionary[instrument]
-                                            ['ldlaw'])
-
-                                # If log_like_calc is True (by default during juliet.fit), don't bother saving the lightcurve of planet p_i:
-                                if self.log_like_calc:
-                                  
-                                    if not self.dictionary[instrument]['TranEclFit']:
-
-                                        self.model[instrument]['M'] += m.light_curve(self.model[instrument]['params']) - 1. 
-
-                                    else:
-
-                                        # In combined transit + eclipse models, assume by default any phase-curve variations are being modelled externally 
-                                        # by default (by, e.g., systematics models, phase-curve variations added later, etc.). To this end, note batman has out-of-eclipse 
-                                        # model variations 1 + fp --- with in-eclipse always being 1. Subtract fp then::
-                                        transit_model = m[0].light_curve(self.model[instrument]['params'])
-                                        eclipse_model = m[1].light_curve(self.model[instrument]['params'])
-
-                                        # Now, figure out if a phase-curve model is being fit or not:
-                                        if (not self.dictionary[instrument]['PhaseCurveFit']) and (not self.dictionary[instrument]['CowanAgolPCFit']) and (not self.dictionary[instrument]['LambertPCFit']) and (not self.dictionary[instrument]['KelpHomoPCFit']) and (not self.dictionary[instrument]['KelpThmPCFit']) and (not self.dictionary[instrument]['KelpInhomoPCFit']):
-
-                                            eclipse_model = eclipse_model - self.model[instrument]['params'].fp
-                                            self.model[instrument]['M'] += transit_model * eclipse_model - 1.
-
-                                        else:
-
-                                            # We are creating one more variable, called phase_curve_model, and defining it outside of this if/else loop
-                                            # This is because if there are more than one phase curve models (e.g., reflected + thermal), we can add them
-
-                                            phase_curve_model = np.zeros( len( self.model[instrument]['m'][1].t ) )
-
-                                            if self.dictionary[instrument]['PhaseCurveFit']:
-
-                                                orbital_phase = ( ( ( self.model[instrument]['m'][1].t - self.model[instrument]['params'].t0 ) / self.model[instrument]['params'].per ) % 1 )
-                                                center_phase = - np.pi / 2.
-
-                                                # Build model. First, the basis sine function:
-                                                sine_model = np.sin(2. * np.pi * (orbital_phase) + center_phase + phase_offset * (np.pi / 180.) )
-                                                # Scale to be 1 at secondary eclipse, 0 at transit:
-                                                sine_model = (sine_model + 1) * 0.5
-                                                # Amplify by phase-amplitude:
-                                                sine_model = (self.model[instrument]['params'].fp) * sine_model
-
-                                                # Adding the sine_model to the full phase curve model
-                                                phase_curve_model = phase_curve_model + sine_model
-
-                                                # Multiply by normed eclipse model (we will do this outside of this if/else loop so that we can add more than one phase curve models):
-                                                #sine_model = 1. + sine_model * ((eclipse_model - 1.) / self.model[instrument]['params'].fp)
-
-                                            if self.dictionary[instrument]['CowanAgolPCFit']:
-
-                                                # Computing (sort of phase: I am following Zhang et al. 2024)
-                                                omega_t = 2 * np.pi * (self.model[instrument]['m'][1].t - self.model[instrument]['params'].t_secondary) / self.model[instrument]['params'].per
-
-                                                # 2nd order Phase curve model: Fp + C1*cos(wt) - C1 + D1*sin(wt) + C2*cos(2wt) - C2 + D2*sin(2wt)
-                                                pc_CA08 = self.model[instrument]['params'].fp + ( C1_CA08 * (np.cos( omega_t ) - 1.) ) + ( D1_CA08 * np.sin( omega_t ) ) + ( C2_CA08 * (np.cos( 2*omega_t ) - 1.) ) + ( D2_CA08 * np.sin( 2*omega_t ) )
-
-                                                # Adding the pc_CA08 model to the full phase curve model
-                                                phase_curve_model = phase_curve_model + pc_CA08
-
-                                                # And multiplying the PC model with the occultation model (we will do this outside of this if/else loop)
-                                                #sine_model = 1. + pc_CA08 * ((eclipse_model - 1.) / self.model[instrument]['params'].fp)
-
-                                            if self.dictionary[instrument]['LambertPCFit']:
-
-                                                # The Lambertian model is from Deline et al. (2022); see their Section 4.4.3.
-
-                                                ## First we need to find true anomaly
-                                                true_anomaly = self.model[instrument]['m'][1].get_true_anomaly()
-
-                                                # Now computing alpha
-                                                alpha_phs = np.arccos( -np.sin( np.radians(self.model[instrument]['m'][1].w) + true_anomaly ) * np.sin( np.radians( self.model[instrument]['m'][1].inc ) ) )
-
-                                                # Eccentricity factor
-                                                ecc_facs = ( 1 + self.model[instrument]['m'][1].ecc * np.cos( true_anomaly ) ) / ( 1 - self.model[instrument]['m'][1].ecc**2 )
-
-                                                lambert_model = Ag_Lambert * ( self.model[instrument]['m'][1].rp * ecc_facs / self.model[instrument]['m'][1].a )**2 * ( np.sin(alpha_phs) + (np.pi - alpha_phs)*np.cos(alpha_phs) ) / np.pi
-
-                                                # Finally, adding Lambert model to the phase curve model
-                                                phase_curve_model = phase_curve_model + lambert_model
-
-                                            if self.dictionary[instrument]['KelpHomoPCFit']:
-
-                                                kelp_homo_refl_pc = kelp_homogeneous_refl_pc_model(times=self.model[instrument]['m'][1].t,\
-                                                                                                   t0=self.model[instrument]['params'].t0,\
-                                                                                                   per=self.model[instrument]['params'].per,\
-                                                                                                   ar=self.model[instrument]['params'].a,\
-                                                                                                   rprs=self.model[instrument]['params'].rp,\
-                                                                                                   g=g_scatasym, single_scat_albedo=w_singlescat,\
-                                                                                                   nknots=self.kelp_refl_interpolation_knots)
-                                                
-                                                # Finally, adding this model to the phase curve model
-                                                phase_curve_model = phase_curve_model + kelp_homo_refl_pc
-
-                                            if self.dictionary[instrument]['KelpThmPCFit']:
-
-                                                kelp_thm_pc = kelp_thermal_pc_model(times=self.model[instrument]['m'][1].t,\
-                                                                                    t0=self.model[instrument]['params'].t0,\
-                                                                                    per=self.model[instrument]['params'].per,\
-                                                                                    ar=self.model[instrument]['params'].a,\
-                                                                                    rprs=self.model[instrument]['params'].rp,\
-                                                                                    filter_wavelength=self.kelp_filt_wav[instrument],\
-                                                                                    filter_transmittance=self.kelp_filt_trans[instrument],\
-                                                                                    hotspot_offset=hotspot_off, c11=cml11, fprime=fprime,\
-                                                                                    alpha=alpha_fluid, omega_drag=wdrag, Teff=self.stellar_teff,\
-                                                                                    ntheta=self.kelp_ntheta, nphi=self.kelp_nphi,\
-                                                                                    nknots=self.kelp_thm_interpolation_knots)
-                                                
-                                                # Finally, adding this model to the phase curve model
-                                                phase_curve_model = phase_curve_model + kelp_thm_pc
-
-                                            if self.dictionary[instrument]['KelpInhomoPCFit']:
-
-                                                kelp_inhomorefl_pc = kelp_inhomogeneous_refl_pc_model(times=self.model[instrument]['m'][1].t,\
-                                                                                                      t0=self.model[instrument]['params'].t0,\
-                                                                                                      per=self.model[instrument]['params'].per,\
-                                                                                                      ar=self.model[instrument]['params'].a,\
-                                                                                                      rprs=self.model[instrument]['params'].rp,\
-                                                                                                      w0=w0, wp=wp, Ag=agkelp, x1=x1, x2=x2,\
-                                                                                                      nknots=self.kelp_refl_interpolation_knots)
-                                                
-                                                # Finally, adding this model to the total phase curve model
-                                                phase_curve_model = phase_curve_model + kelp_inhomorefl_pc
-
-                                            # Now multiplying the phase curve model with the occultation model
-                                            phase_curve_model = 1 + phase_curve_model * ((eclipse_model - 1.) / self.model[instrument]['params'].fp)
-
-                                            self.model[instrument]['M'] += transit_model * phase_curve_model - 1.
- 
-                                else:
-                                  
-                                    if not self.dictionary[instrument]['TranEclFit']:
-
-                                        self.model[instrument]['p'+str(i)] = m.light_curve(self.model[instrument]['params'])
-                                        self.model[instrument]['M'] += self.model[instrument]['p'+str(i)] - 1. 
-
-                                    else:
-
-                                        # In combined transit + eclipse models, assume by default any phase-curve variations are being modelled externally 
-                                        # by default (by, e.g., systematics models, phase-curve variations added later, etc.). To this end, note batman has out-of-eclipse 
-                                        # model variations 1 + fp --- with in-eclipse always being 1. Subtract fp then:
-                                        transit_model = m[0].light_curve(self.model[instrument]['params'])
-                                        eclipse_model = m[1].light_curve(self.model[instrument]['params'])
-
-                                        # Now, figure out if a phase-curve model is being fit or not:
-                                        if (not self.dictionary[instrument]['PhaseCurveFit']) and (not self.dictionary[instrument]['CowanAgolPCFit']) and (not self.dictionary[instrument]['LambertPCFit']) and (not self.dictionary[instrument]['KelpHomoPCFit']) and (not self.dictionary[instrument]['KelpThmPCFit']) and (not self.dictionary[instrument]['KelpInhomoPCFit']):
-
-                                            eclipse_model = eclipse_model - self.model[instrument]['params'].fp
-                                            self.model[instrument]['p'+str(i)] = transit_model * eclipse_model
-
-                                        else:
-
-                                            # We are creating one more variable, called phase_curve_model, and defining it outside of this if/else loop
-                                            # This is because if there are more than one phase curve models (e.g., reflected + thermal), we can add them
-
-                                            phase_curve_model = np.zeros( len( self.model[instrument]['m'][1].t ) )
-
-                                            if self.dictionary[instrument]['PhaseCurveFit']:
-
-                                                orbital_phase = ( ( ( self.model[instrument]['m'][1].t - self.model[instrument]['params'].t0 ) / self.model[instrument]['params'].per ) % 1 )
-                                                center_phase = - np.pi / 2.
-
-                                                # Build model. First, the basis sine function:
-                                                sine_model = np.sin(2. * np.pi * (orbital_phase) + center_phase + phase_offset * (np.pi / 180.) )
-                                                # Scale to be 1 at secondary eclipse, 0 at transit:
-                                                sine_model = (sine_model + 1) * 0.5
-                                                # Amplify by phase-amplitude:
-                                                sine_model = (self.model[instrument]['params'].fp) * sine_model
-                                                
-                                                # Adding the sine_model to the full phase curve model
-                                                phase_curve_model = phase_curve_model + sine_model
-
-                                                # Multiply by normed eclipse model (we will do this outside of this if/else loop):
-                                                #sine_model = 1. + sine_model * ((eclipse_model - 1.) / self.model[instrument]['params'].fp)
-
-                                            if self.dictionary[instrument]['CowanAgolPCFit']:
-
-                                                # Computing (sort of phase: I am following Zhang et al. 2024)
-                                                omega_t = 2 * np.pi * (self.model[instrument]['m'][1].t - self.model[instrument]['params'].t_secondary) / self.model[instrument]['params'].per
-
-                                                # 2nd order Phase curve model: Fp + C1*cos(wt) - C1 + D1*sin(wt) + C2*cos(2wt) - C2 + D2*sin(2wt)
-                                                pc_CA08 = self.model[instrument]['params'].fp + ( C1_CA08 * (np.cos( omega_t ) - 1.) ) + ( D1_CA08 * np.sin( omega_t ) ) + ( C2_CA08 * (np.cos( 2*omega_t ) - 1.) ) + ( D2_CA08 * np.sin( 2*omega_t ) )
-
-                                                # Adding the pc_CA08 model to the full phase curve model
-                                                phase_curve_model = phase_curve_model + pc_CA08
-
-                                                # And multiplying the PC model with the occultation model (we will do this outside of this if/else loop)
-                                                #sine_model = 1. + pc_CA08 * ((eclipse_model - 1.) / self.model[instrument]['params'].fp)
-
-                                            if self.dictionary[instrument]['LambertPCFit']:
-
-                                                # The Lambertian model is from Deline et al. (2022); see their Section 4.4.3.
-
-                                                ## First we need to find true anomaly
-                                                true_anomaly = self.model[instrument]['m'][1].get_true_anomaly()
-
-                                                # Now computing alpha
-                                                alpha_phs = np.arccos( -np.sin( np.radians(self.model[instrument]['m'][1].w) + true_anomaly ) * np.sin( np.radians( self.model[instrument]['m'][1].inc ) ) )
-
-                                                # Eccentricity factor
-                                                ecc_facs = ( 1 + self.model[instrument]['m'][1].ecc * np.cos( true_anomaly ) ) / ( 1 - self.model[instrument]['m'][1].ecc**2 )
-
-                                                lambert_model = Ag_Lambert * ( self.model[instrument]['m'][1].rp * ecc_facs / self.model[instrument]['m'][1].a )**2 * ( np.sin(alpha_phs) + (np.pi - alpha_phs)*np.cos(alpha_phs) ) / np.pi
-
-                                                # Finally, adding Lambert model to the phase curve model
-                                                phase_curve_model = phase_curve_model + lambert_model
-
-                                            if self.dictionary[instrument]['KelpHomoPCFit']:
-
-                                                kelp_homo_refl_pc = kelp_homogeneous_refl_pc_model(times=self.model[instrument]['m'][1].t,\
-                                                                                                   t0=self.model[instrument]['params'].t0,\
-                                                                                                   per=self.model[instrument]['params'].per,\
-                                                                                                   ar=self.model[instrument]['params'].a,\
-                                                                                                   rprs=self.model[instrument]['params'].rp,\
-                                                                                                   g=g_scatasym, single_scat_albedo=w_singlescat,\
-                                                                                                   nknots=self.kelp_refl_interpolation_knots)
-                                                
-                                                # Finally, adding this model to the phase curve model
-                                                phase_curve_model = phase_curve_model + kelp_homo_refl_pc
-
-                                            if self.dictionary[instrument]['KelpThmPCFit']:
-
-                                                kelp_thm_pc = kelp_thermal_pc_model(times=self.model[instrument]['m'][1].t,\
-                                                                                    t0=self.model[instrument]['params'].t0,\
-                                                                                    per=self.model[instrument]['params'].per,\
-                                                                                    ar=self.model[instrument]['params'].a,\
-                                                                                    rprs=self.model[instrument]['params'].rp,\
-                                                                                    filter_wavelength=self.kelp_filt_wav[instrument],\
-                                                                                    filter_transmittance=self.kelp_filt_trans[instrument],\
-                                                                                    hotspot_offset=hotspot_off, c11=cml11, fprime=fprime,\
-                                                                                    alpha=alpha_fluid, omega_drag=wdrag, Teff=self.stellar_teff,\
-                                                                                    ntheta=self.kelp_ntheta, nphi=self.kelp_nphi,\
-                                                                                    nknots=self.kelp_thm_interpolation_knots)
-                                                
-                                                # Finally, adding this model to the phase curve model
-                                                phase_curve_model = phase_curve_model + kelp_thm_pc
-
-                                            if self.dictionary[instrument]['KelpInhomoPCFit']:
-
-                                                kelp_inhomorefl_pc = kelp_inhomogeneous_refl_pc_model(times=self.model[instrument]['m'][1].t,\
-                                                                                                      t0=self.model[instrument]['params'].t0,\
-                                                                                                      per=self.model[instrument]['params'].per,\
-                                                                                                      ar=self.model[instrument]['params'].a,\
-                                                                                                      rprs=self.model[instrument]['params'].rp,\
-                                                                                                      w0=w0, wp=wp, Ag=agkelp, x1=x1, x2=x2,\
-                                                                                                      nknots=self.kelp_refl_interpolation_knots)
-                                                
-                                                # Finally, adding this model to the total phase curve model
-                                                phase_curve_model = phase_curve_model + kelp_inhomorefl_pc
-
-                                            # And finally multiplying the phase curve model with the occultation model
-                                            phase_curve_model = 1 + phase_curve_model * ((eclipse_model - 1.) / self.model[instrument]['params'].fp)
-
-                                            self.model[instrument]['p'+str(i)] = transit_model * phase_curve_model
-
-                                        self.model[instrument]['M'] += self.model[instrument]['p'+str(i)] - 1.
-
-                        else:
-                            self.modelOK = False
-                            return False
-
-            # Once either the transit model is generated or after populating the full_model with ones if no transit fit is on,
-            # convert the lightcurve so it complies with the juliet model accounting for the dilution and the mean out-of-transit flux:
-            D, M = parameter_values[
-                'mdilution_' +
-                self.mdilution_iname[instrument]], parameter_values['mflux_' +
-                                                                    self.mflux_iname[instrument]]
-            self.model[instrument]['M'] = (self.model[instrument]['M'] * D +
-                                           (1. - D)) * (1. / (1. + D * M))
-
-            # Now, if a linear model was defined, generate it and add it to the full model:
-            if self.lm_boolean[instrument]:
-
-                self.model[instrument]['LM'] = np.zeros(self.ndatapoints_per_instrument[instrument])
-                for i in range(self.lm_n[instrument]):
-
-                    self.model[instrument]['LM'] += parameter_values['theta' + str(i) + '_' + self.theta_iname[str(i)+instrument]] * \
-                                                    self.lm_arguments[instrument][:, i]
-
-                self.model[instrument]['deterministic'] = self.model[instrument]['M'] + self.model[instrument]['LM']
-
-            else:
-
-                self.model[instrument]['deterministic'] = self.model[instrument]['M']
-            
-            # Now, if a non-linear model was defined, generate it and add it to the full model:
-            if self.nlm_boolean[instrument]:
-
-                self.model[instrument]['NLM'] = self.non_linear_functions[instrument]['function']( \
-                                                     self.non_linear_functions[instrument]['regressor'], \
-                                                     parameter_values,\
-                                                                                                 )
-
-
-                if self.multiplicative_non_linear_function[instrument]:
-
-                    self.model[instrument]['deterministic'] *= self.model[instrument]['NLM']
-
-                else:
-
-                    self.model[instrument]['deterministic'] += self.model[instrument]['NLM']
-
-
-            self.model[instrument][
-                'deterministic_variances'] = self.errors[instrument]**2 + (
-                    parameter_values['sigma_w_' + self.sigmaw_iname[instrument]] * 1e-6)**2
-
-            # Finally, if the model under consideration is a global model, populate the global model dictionary:
-            if self.global_model:
-                self.model['global'][self.instrument_indexes[
-                    instrument]] = self.model[instrument]['deterministic']
-                if evaluate_global_errors:
-                    self.model['global_variances'][self.instrument_indexes[instrument]] = self.yerr[self.instrument_indexes[instrument]]**2 + \
-                                                                                          (parameter_values['sigma_w_'+instrument]*1e-6)**2
-
-    def gaussian_log_likelihood(self, residuals, variances):
-
-        taus = 1. / variances
-        return -0.5 * (len(residuals) * log2pi + np.sum(-np.log(taus.astype(float)) + taus * (residuals**2)))
-
-    def get_log_likelihood(self, parameter_values):
-        if self.global_model:
-            residuals = self.y - self.model['global']
-            if self.dictionary['global_model']['GPDetrend']:
-                self.dictionary['global_model'][
-                    'noise_model'].set_parameter_vector(parameter_values)
-                self.dictionary['global_model']['noise_model'].yerr = np.sqrt(
-                    self.model['global_variances'])
-                self.dictionary['global_model']['noise_model'].compute_GP()
-                return self.dictionary['global_model'][
-                    'noise_model'].GP.log_likelihood(residuals)
-            else:
-                self.gaussian_log_likelihood(residuals,
-                                             self.model['global_variances'])
-        else:
-            log_like = 0.0
-
-            for instrument in self.inames:
-                residuals = self.data[instrument] - self.model[instrument][
-                    'deterministic']
-                if self.dictionary[instrument]['GPDetrend']:
-                    self.dictionary[instrument][
-                        'noise_model'].set_parameter_vector(parameter_values)
-                    # Catch possible GP evaluation errors:
-                    try:
-                        log_like += self.dictionary[instrument][
-                            'noise_model'].GP.log_likelihood(residuals)
-                    except:
-                        log_like = -np.inf
-                        break
-                else:
-
-                    log_like += self.gaussian_log_likelihood(
-                        residuals,
-                        self.model[instrument]['deterministic_variances'])
-
-            return log_like
-
     def set_posterior_samples(self, posterior_samples):
         self.posteriors = posterior_samples
         self.median_posterior_samples = {}
@@ -4624,7 +2711,7 @@ class model(object):
                 self.median_posterior_samples[parameter] = np.median(self.posteriors[parameter])
 
         for parameter in self.priors:
-            if self.priors[parameter]['distribution'] == 'fixed':
+            if self.priors[parameter]['distribution'].lower() == 'fixed':
                 self.median_posterior_samples[parameter] = self.priors[
                     parameter]['hyperparameters']
         try:
@@ -4633,6 +2720,19 @@ class model(object):
             print(
                 'Warning: model evaluated at the posterior median did not compute properly.'
             )
+
+    def _check_jax_support(self):
+        """Raise an error for features of previous juliet versions that the JAX backend does not support."""
+        for instrument in self.inames:
+            d = self.dictionary[instrument]
+            if d.get('TransitFitCatwoman', False) and (d.get('EclipseFit', False) or d.get('TranEclFit', False)):
+                raise NotImplementedError('Instrument ' + instrument + ': catwoman (asymmetric) transits can not be combined with '
+                                          'eclipses.')
+            if d.get('TransitFitCatwoman', False) and any(self.dictionary['efficient_bp'].values()):
+                raise NotImplementedError('catwoman (asymmetric) transits require the (b, p1, p2) parametrization, not (r1, r2).')
+            if (d.get('TransitFit', False) or d.get('TranEclFit', False)) and d['ldlaw'] not in jm.SUPPORTED_LD_LAWS:
+                raise NotImplementedError('Instrument ' + instrument + ': limb-darkening law "' + d['ldlaw'] + '" is not available '
+                                          '(available laws: ' + ', '.join(jm.SUPPORTED_LD_LAWS[:2] + jm.NUMERICAL_LD_LAWS) + ').')
 
     def __init__(self,
                  data,
@@ -4653,6 +2753,8 @@ class model(object):
                  log_like_calc=False):
         # Inhert the priors dictionary from data:
         self.priors = data.priors
+        self.fixed_values = {p: float(self.priors[p]['hyperparameters']) for p in self.priors
+                             if self.priors[p]['distribution'].lower() == 'fixed'}
         # Define the ecclim value:
         self.ecclim = ecclim
         # Define ta:
@@ -4671,12 +2773,10 @@ class model(object):
         self.kelp_refl_interpolation_knots = kelp_refl_interpolation_knots
         self.kelp_thm_interpolation_knots = kelp_thm_interpolation_knots
 
-        # Kelp thermal phase curve also needs transmission functions...
-        ## These needs to be dict, with keys corresponding to instrument names
+        # Kelp thermal phase curve also needs transmission functions (dicts, with keys corresponding to instrument names),
+        # stellar effective temperatures, and number of grid points along latitude (theta) and longitude (phi):
         self.kelp_filt_wav = kelp_filt_wav
         self.kelp_filt_trans = kelp_filt_trans
-
-        # ... and stellar effective temperatures, and number of grid points along latitude (theta) and longitude (phi)
         self.stellar_teff = stellar_teff
         self.kelp_ntheta = kelp_ntheta
         self.kelp_nphi = kelp_nphi
@@ -4692,26 +2792,13 @@ class model(object):
         # Set nlm:
         self.non_linear_functions = data.non_linear_functions
         # Check if multiplicative of additive functions for each instrument:
+        self.multiplicative_non_linear_function = {}
         if self.non_linear_functions is not None:
-
-           self.multiplicative_non_linear_function = {}
 
            for k in list(self.non_linear_functions.keys()):
 
-                if 'multiplicative' in self.non_linear_functions[k].keys():
-
-                    if self.non_linear_functions[k]['multiplicative']:
-
-                        self.multiplicative_non_linear_function[k] = True
-
-                    else:
-
-                        self.multiplicative_non_linear_function[k] = False
-
-                else:
-
-                    # For back-compatibility:
-                    self.multiplicative_non_linear_function[k] = False
+                # (False by default for back-compatibility):
+                self.multiplicative_non_linear_function[k] = bool(self.non_linear_functions[k].get('multiplicative', False))
 
         # Number of datapoints per instrument variable:
         self.ndatapoints_per_instrument = {}
@@ -4722,7 +2809,6 @@ class model(object):
             # "global" data-arrays. These have the data from all the instruments stacked into an array; to recover
             # the data for a given instrument, one uses the self.instrument_indexes dictionary. On the other hand,
             # self.times, self.data and self.errors are dictionaries that on each key have the data of a given instrument.
-            # Calling dictionaries is faster than calling indexes of arrays, so we use the latter in general to evaluate models.
             self.t = data.t_lc
             self.y = data.y_lc
             self.yerr = data.yerr_lc
@@ -4747,11 +2833,6 @@ class model(object):
             self.numbering.sort()
             self.nplanets = len(self.numbering)
             self.model = {}
-            # First, if a global model, generate array that will save this:
-            if self.global_model:
-                self.model['global'] = np.zeros(len(self.t))
-                self.model['global_variances'] = np.zeros(len(self.t))
-                self.model['deterministic'] = np.zeros(len(self.t))
             # If limb-darkening, dilution factors or eclipse depth will be shared by different instruments, set the correct variable name for each:
             self.ld_iname = {}
             self.sigmaw_iname = {}
@@ -4763,7 +2844,7 @@ class model(object):
             self.kelpinhomo_iname = {}
             self.kelpthm_iname = {}
             self.phaseoffset_iname = {}
-            # To make transit depth (for batman and catwoman models) will be shared by different instruments, set the correct variable name for each:
+            # To make transit depth will be shared by different instruments, set the correct variable name for each:
             self.p_iname = {}
             self.p1_iname = {}
             # Since p, p1 (p2) and fp are all planetary and instrumental parameters,
@@ -4806,61 +2887,6 @@ class model(object):
                 if self.lm_boolean[instrument]:
                     self.lm_n[instrument] = self.lm_arguments[instrument].shape[
                         1]
-                # An array of ones to copy around:
-                self.model[instrument]['ones'] = np.ones( len(self.instrument_indexes[instrument]) )
-
-                # Generate internal model variables of interest to the user. First, the lightcurve model in the notation of juliet (Mi)
-                # (full lightcurve plus dilution factors and mflux):
-                self.model[instrument]['M'] = np.ones(
-                    len(self.instrument_indexes[instrument]))
-                # Linear model (in the notation of juliet, LM):
-                self.model[instrument]['LM'] = np.zeros(
-                    len(self.instrument_indexes[instrument]))
-                # Now, generate dictionary that will save the final full, deterministic model (M + LM):
-                self.model[instrument]['deterministic'] = np.zeros(
-                    len(self.instrument_indexes[instrument]))
-                # Same for the errors:
-
-                self.model[instrument]['deterministic_errors'] = np.zeros( len(self.instrument_indexes[instrument]) )
-                if self.dictionary[instrument]['TransitFit'] or self.dictionary[instrument]['EclipseFit'] or self.dictionary[instrument]['TranEclFit']:
-
-                    # First, take the opportunity to initialize transit lightcurves for each instrument:
-                    if self.dictionary[instrument]['resampling']:
-                        if not self.dictionary[instrument]['TransitFitCatwoman']:
-                            if self.dictionary[instrument]['TransitFit']:
-                                self.model[instrument]['params'], [self.model[instrument]['m'],_] = init_batman(self.times[instrument], self.dictionary[instrument]['ldlaw'],\
-                                                                                                            nresampling = self.dictionary[instrument]['nresampling'],\
-                                                                                                            etresampling = self.dictionary[instrument]['exptimeresampling'])
-                            elif self.dictionary[instrument]['EclipseFit']:
-                                self.model[instrument]['params'], [_,self.model[instrument]['m']] = init_batman(self.times[instrument], self.dictionary[instrument]['ldlaw'], \
-                                                                                                            nresampling = self.dictionary[instrument]['nresampling'],\
-                                                                                                            etresampling = self.dictionary[instrument]['exptimeresampling'])
-                            elif self.dictionary[instrument]['TranEclFit']:
-                                self.model[instrument]['params'], self.model[instrument]['m'] = init_batman(self.times[instrument], self.dictionary[instrument]['ldlaw'], \
-                                                                                                            nresampling = self.dictionary[instrument]['nresampling'],\
-                                                                                                            etresampling = self.dictionary[instrument]['exptimeresampling'])
-                        else:
-                            self.model[instrument]['params'], self.model[instrument]['m'] = init_catwoman(self.times[instrument], self.dictionary[instrument]['ldlaw'],\
-                                                                                                        nresampling = self.dictionary[instrument]['nresampling'],\
-                                                                                                        etresampling = self.dictionary[instrument]['exptimeresampling'])
-                    else:
-                        if not self.dictionary[instrument]['TransitFitCatwoman']:
-                            if self.dictionary[instrument]['TransitFit']:
-                                self.model[instrument]['params'], [self.model[instrument]['m'],_] = init_batman(self.times[instrument], \
-                                                                                                                self.dictionary[instrument]['ldlaw'])
-                            elif self.dictionary[instrument]['EclipseFit']:
-                                self.model[instrument]['params'], [_,self.model[instrument]['m']] = init_batman(self.times[instrument], \
-                                                                                                                self.dictionary[instrument]['ldlaw'])
-                            elif self.dictionary[instrument]['TranEclFit']:
-                                self.model[instrument]['params'], self.model[instrument]['m'] = init_batman(self.times[instrument], \
-                                                                                                                self.dictionary[instrument]['ldlaw'])
-                        else:
-                            self.model[instrument]['params'], self.model[instrument]['m'] = init_catwoman(self.times[instrument], \
-                                                                                                               self.dictionary[instrument]['ldlaw'])
-                    # Individual transit lightcurves for each planet:
-                    for i in self.numbering:
-                        self.model[instrument]['p' + str(i)] = np.ones(
-                            len(self.instrument_indexes[instrument]))
 
                 # First, check some edge cases of user input error. First, if user decided to use a_p1 and rho, raise an error:
                 if ('a_p1' in self.priors.keys()) and ('rho' in self.priors.keys()):
@@ -4890,23 +2916,23 @@ class model(object):
                     if pname[0:5] == 'theta':
                         vec = pname.split('_')
                         theta_number = vec[0][5:]
-                        if len(vec) > 2: 
+                        if len(vec) > 2:
                             if instrument in vec:
                                 self.theta_iname[theta_number+instrument] = '_'.join(
                                     vec[1:])
                         else:
-                            if instrument in vec: 
+                            if instrument in vec:
                                 self.theta_iname[theta_number+instrument] = vec[1]
                     # Check if sigma_w:
                     if pname[0:7] == 'sigma_w':
                         vec = pname.split('_')
-                        if len(vec) > 3: 
-                            if instrument in vec: 
+                        if len(vec) > 3:
+                            if instrument in vec:
                                 self.sigmaw_iname[instrument] = '_'.join(
                                     vec[2:])
                         else:
-                            if instrument in vec: 
-                                self.sigmaw_iname[instrument] = vec[2] 
+                            if instrument in vec:
+                                self.sigmaw_iname[instrument] = vec[2]
                     # Check if it is a dilution factor:
                     if pname[0:9] == 'mdilution':
                         vec = pname.split('_')
@@ -4927,219 +2953,49 @@ class model(object):
                             if instrument in vec:
                                 self.mflux_iname[instrument] = vec[1]
 
-                    if pname[0:2] == 'fp':
+                    # Planetary and instrumental parameters (e.g., fp_p1, fp_p1_inst or fp_p1_inst1_inst2):
+                    for prefix, length, iname_dict, label in [('fp', 2, self.fp_iname, 'fp'),
+                                                              ('aglambert', 9, self.aglambert_iname, 'aglambert'),
+                                                              ('singlescat', 10, self.kelphomo_iname, 'singlescat'),
+                                                              ('cml11', 5, self.kelpthm_iname, 'cml11'),
+                                                              ('agkelp', 6, self.kelpinhomo_iname, 'agkelp'),
+                                                              ('phaseoffset', 11, self.phaseoffset_iname, 'phaseoffset'),
+                                                              ('p_', 2, self.p_iname, 'p'),
+                                                              ('p1', 2, self.p1_iname, 'p1/p2')]:
 
-                        # Note that eclipse and transit depths can be a planetary and instrumental parameter
-                        vec = pname.split('_')
-                        if len(vec) > 3:
+                        if pname[0:length] == prefix:
 
-                            # This is the case in which multiple instruments share an eclipse depth, e.g., fp_p1_TESS1_TESS2
-                            if instrument in vec:
+                            vec = pname.split('_')
+                            if len(vec) > 3:
 
-                                self.fp_iname[vec[1]][instrument] = '_' + '_'.join(vec[2:])
+                                # This is the case in which multiple instruments share the parameter, e.g., fp_p1_TESS1_TESS2
+                                if instrument in vec:
 
-                        elif len(vec) == 3:
+                                    iname_dict[vec[1]][instrument] = '_' + '_'.join(vec[2:])
 
-                            # This is the case of a single instrument with fp, e.g., fp_p1_TESS
-                            if instrument in vec:
-                                
-                                self.fp_iname[vec[1]][instrument] = '_' + vec[2]
+                            elif len(vec) == 3:
 
-                        elif len(vec) == 2:
-                                
-                            # This adds back-compatibility so users can define a common fp for all instruments (e.g., fp_p1):
-                            self.fp_iname[vec[1]][instrument] = ''
+                                # This is the case of a single instrument, e.g., fp_p1_TESS
+                                if instrument in vec:
 
-                        else:
+                                    iname_dict[vec[1]][instrument] = '_' + vec[2]
 
-                            raise Exception('Prior for fp is not properly defined: must be, e.g., fp_p1, fp_p1_inst or fp_p1_inst1_inst2. Currently is '+pname)
-                        
-                    if pname[0:9] == 'aglambert':
+                            elif len(vec) == 2:
 
-                        # Note that amplitude can be a planetary and instrumental parameter
-                        vec = pname.split('_')
-                        if len(vec) > 3:
+                                # This adds back-compatibility so users can define a common parameter for all instruments (e.g., fp_p1):
+                                iname_dict[vec[1]][instrument] = ''
 
-                            # This is the case in which multiple instrument share the parameter
-                            if instrument in vec:
-                                self.aglambert_iname[vec[1]][instrument] = '_' + '_'.join(vec[2:])
+                            else:
 
-                        elif len(vec) == 3:
+                                raise Exception('Prior for ' + label + ' is not properly defined: must be, e.g., ' + label.split('/')[0] + '_p1, ' +
+                                                label.split('/')[0] + '_p1_inst or ' + label.split('/')[0] + '_p1_inst1_inst2. Currently is ' + pname)
 
-                            # This is the case of a single instrument
-                            if instrument in vec:
-                                self.aglambert_iname[vec[1]][instrument] = '_' + vec[2]
-                        
-                        elif len(vec) == 2:
-
-                            # This adds back-compatibility so users can define a common prior for all instruments:
-                            self.aglambert_iname[vec[1]][instrument] = ''
-                        
-                        else:
-
-                            raise Exception('Prior for aglambert is not properly defined: must be, e.g., aglambert_p1, aglambert_p1_inst or aglambert_p1_inst1_inst2. Currently is '+pname)
-                        
-                    if pname[0:10] == 'singlescat':
-
-                        # Note that single scattering albedo can be a planetary and instrumental parameter
-
-                        vec = pname.split('_')
-                        if len(vec) > 3:
-
-                            # This is the case in which multiple instruments share the parameter:
-                            if instrument in vec:
-
-                                self.kelphomo_iname[vec[1]][instrument] = '_' + '_'.join(vec[2:])
-
-                        elif len(vec) == 3:
-
-                            # This is the case of a single instrument:
-                            if instrument in vec:
-
-                                self.kelphomo_iname[vec[1]][instrument] = '_' + vec[2]
-
-                        elif len(vec) == 2:
-
-                            # This adds back-compatibility so users can define a common for all instruments:
-                            self.kelphomo_iname[vec[1]][instrument] = ''
-
-                        else:
-
-                            raise Exception('Prior for singlescat is not properly defined: must be, e.g., singlescat_p1, singlescat_p1_inst or singlescat_p1_inst1_inst2. Currently is '+pname)
-                        
-                    if pname[0:5] == 'cml11':
-
-                        # Note that cml11 can be a planetary and instrumental parameter
-                        vec = pname.split('_')
-                        if len(vec) > 3:
-
-                            # This is the case in which multiple instruments share the parameter:
-                            if instrument in vec:
-
-                                self.kelpthm_iname[vec[1]][instrument] = '_' + '_'.join(vec[2:])
-
-                        elif len(vec) == 3:
-
-                            # This is the case of a single instrument:
-                            if instrument in vec:
-
-                                self.kelpthm_iname[vec[1]][instrument] = '_' + vec[2]
-
-                        elif len(vec) == 2:
-
-                            # This adds back-compatibility so users can define a common for all instruments:
-                            self.kelpthm_iname[vec[1]][instrument] = ''
-
-                        else:
-
-                            raise Exception('Prior for cml11 is not properly defined: must be, e.g., cml11_p1, cml11_p1_inst or cml11_p1_inst1_inst2. Currently is '+pname)
-                        
-                    if pname[0:6] == 'agkelp':
-
-                        # Note that the agkelp parameter can be a planetary and instrumental parameter
-                        vec = pname.split('_')
-                        if len(vec) > 3:
-
-                            # This is the case in which multiple instruments share the parameter:
-                            if instrument in vec:
-
-                                self.kelpinhomo_iname[vec[1]][instrument] = '_' + '_'.join(vec[2:])
-
-                        elif len(vec) == 3:
-
-                            # This is the case of a single instrument:
-                            if instrument in vec:
-
-                                self.kelpinhomo_iname[vec[1]][instrument] = '_' + vec[2]
-
-                        elif len(vec) == 2:
-
-                            # This adds back-compatibility so users can define a common for all instruments:
-                            self.kelpinhomo_iname[vec[1]][instrument] = ''
-
-                        else:
-
-                            raise Exception('Prior for agkelp is not properly defined: must be, e.g., agkelp_p1, agkelp_p1_inst or agkelp_p1_inst1_inst2. Currently is '+pname)
-
-
-                    if pname[0:11] == 'phaseoffset':
-                    
-                        # Note that amplitude can be a planetary and instrumental parameter
-                        vec = pname.split('_')
-                        if len(vec) > 3:
-
-                            # This is the case in which multiple instruments share the parameter:
-                            if instrument in vec:
-
-                                self.phaseoffset_iname[vec[1]][instrument] = '_' + '_'.join(vec[2:])
-
-                        elif len(vec) == 3:
-
-                            # This is the case of a single instrument:
-                            if instrument in vec:
-
-                                self.phaseoffset_iname[vec[1]][instrument] = '_' + vec[2]
-
-                        elif len(vec) == 2:
-
-                            # This adds back-compatibility so users can define a common for all instruments:
-                            self.phaseoffset_iname[vec[1]][instrument] = ''
-
-                        else:
-
-                            raise Exception('Prior for phaseoffset is not properly defined: must be, e.g., phaseoffset_p1, phaseoffset_p1_inst or phaseoffset_p1_inst1_inst2. Currently is '+pname)
-
-                    if pname[0:2] == 'p_':
-
-                        vec = pname.split('_')
-                        if len(vec) > 3:
-
-                            # This is the case in which multiple instruments share a planet-to-star ratio, e.g., p_p1_TESS1_TESS2
-                            if instrument in vec:
-
-                                self.p_iname[vec[1]][instrument] = '_' + '_'.join(vec[2:])
-
-                        elif len(vec) == 3:
-
-                            # This is the case of a single instrument with p, e.g., p_p1_TESS:
-                            if instrument in vec:
-
-                                self.p_iname[vec[1]][instrument] = '_' + vec[2]
-
-                        elif len(vec) == 2:
-
-                            # This adds back-compatibility so users can define a common p for all instruments (e.g., p_p1):
-                            self.p_iname[vec[1]][instrument] = ''
-
-                        else:
-
-                            raise Exception('Prior for p is not properly defined: must be, e.g., p_p1, p_p1_inst or p_p1_inst1_inst2. Currently is '+pname)
-
-                    if pname[0:2] == 'p1':
-
-                        vec = pname.split('_')
-                        if len(vec) > 3:
-
-                            # This is the case in which multiple instruments share a CW semi-planet-to-star ratio, e.g., p1_p1_TESS1_TESS2
-                            if instrument in vec:
-
-                                self.p1_iname[vec[1]][instrument] = '_' + '_'.join(vec[2:])
-
-                        elif len(vec) == 3:
-
-                            # This is the case of a single instrument with p1, e.g., p1_p1_TESS:
-                            if instrument in vec: 
-
-                                self.p1_iname[vec[1]][instrument] = '_' + vec[2]
-
-                        elif len(vec) == 2:
-
-                            # This adds back-compatibility so users can define a common p for all instruments (e.g., p_p1):
-                            self.p1_iname[vec[1]][instrument] = ''
-
-                        else:  
-
-                            raise Exception('Prior for p1/p2 is not properly defined: must be, e.g., p1_p1, p1_p1_inst or p1_p1_inst1_inst2. Currently is '+pname)
+            # Flags of whether phase curves are fit for each instrument:
+            self.phase_curve = {}
+            for instrument in self.inames:
+                self.phase_curve[instrument] = any(self.dictionary[instrument][k] for k in
+                                                   ['PhaseCurveFit', 'CowanAgolPCFit', 'LambertPCFit', 'KelpHomoPCFit',
+                                                    'KelpThmPCFit', 'KelpInhomoPCFit'])
 
             # Set the model-type to M(t):
             self.evaluate = self.evaluate_model
@@ -5158,7 +3014,6 @@ class model(object):
             self.ninstruments = data.ninstruments_rv
             self.inames = data.inames_rv
             self.instrument_indexes = data.instrument_indexes_rv
-            self.nlm_boolean = data.nlm_rv_boolean
             self.lm_boolean = data.lm_rv_boolean
             self.nlm_boolean = data.nlm_rv_boolean
             self.lm_arguments = data.lm_rv_arguments
@@ -5171,19 +3026,6 @@ class model(object):
             self.nplanets = len(self.numbering)
             self.model = {}
             self.ndatapoints_all_instruments = 0
-            # First, if a global model, generate array that will save this:
-            if self.global_model:
-                self.model['global'] = np.zeros(len(self.t))
-                self.model['global_variances'] = np.zeros(len(self.t))
-            # Initialize radvel:
-            self.model['radvel'] = init_radvel(nplanets=self.nplanets)
-            # First go around all planets to compute the full RV models:
-            for i in self.numbering:
-                self.model['p' + str(i)] = np.ones(len(self.t))
-            # Now variable to save full RV Keplerian model:
-            self.model['Keplerian'] = np.ones(len(self.t))
-            # Same for Keplerian + trends:
-            self.model['Keplerian+Trend'] = np.ones(len(self.t))
             # Go around each instrument:
             for instrument in self.inames:
                 self.model[instrument] = {}
@@ -5211,36 +3053,71 @@ class model(object):
                         else:
                             if instrument in vec:
                                 self.theta_iname[theta_number+instrument] = vec[1]
-                
-                # Generate internal model variables of interest to the user. First, the RV model in the notation of juliet (Mi)
-                # (full RV model plus offset velocity, plus trend):
-                self.model[instrument]['M'] = np.ones(
-                    len(self.instrument_indexes[instrument]))
-                # Linear model (in the notation of juliet, LM):
-                self.model[instrument]['LM'] = np.zeros(
-                    len(self.instrument_indexes[instrument]))
-                # Now, generate dictionary that will save the final full model (M + LM):
-                self.model[instrument]['deterministic'] = np.zeros(
-                    len(self.instrument_indexes[instrument]))
-                # Same for the errors:
-                self.model[instrument]['deterministic_errors'] = np.zeros(
-                    len(self.instrument_indexes[instrument]))
-                # Individual keplerians for each planet:
-                for i in self.numbering:
-                    self.model[instrument]['p' + str(i)] = np.ones(
-                        len(self.instrument_indexes[instrument]))
-                # An array of ones to copy around:
-                self.model[instrument]['ones'] = np.ones(
-                    len(self.t[self.instrument_indexes[instrument]]))
+
             # Set the model-type to M(t):
             self.evaluate = self.evaluate_model
             self.generate = self.generate_rv_model
         else:
 
             raise Exception(
-                'Model type "' + lc +
+                'Model type "' + modeltype +
                 '" not recognized. Currently it can only be "lc" for a light-curve model or "rv" for radial-velocity model.'
             )
+
+        if self.global_model:
+            self.model['global'] = np.zeros(len(self.t))
+            self.model['global_variances'] = np.zeros(len(self.t))
+
+        # Copy of the instrument names (all of them; used for the T-parametrization of TTVs):
+        self.all_inames = list(self.inames)
+
+        # Non-linear functions as functions of the parameter dictionary (functions not written with jax.numpy are
+        # evaluated on the host via callbacks; see jaxmodels.jax_compatible):
+        self.nlm_functions = {}
+        self.uses_callbacks = False
+        for instrument in self.inames:
+            if self.nlm_boolean[instrument]:
+                nlf = self.non_linear_functions[instrument]
+                fn, is_callback = jm.jax_compatible(lambda pv, f=nlf['function'], x=nlf['regressor']: f(x, pv),
+                                                    jm.example_parameter_values(self.priors),
+                                                    'the non-linear function of instrument ' + instrument)
+                self.nlm_functions[instrument] = fn
+                self.uses_callbacks = self.uses_callbacks or is_callback
+
+        # JAX copies of the data arrays:
+        self.jy = jnp.asarray(self.y, dtype=float)
+        self.jtimes = {k: jnp.asarray(self.times[k], dtype=float) for k in self.inames}
+        self.jdata = {k: jnp.asarray(self.data[k], dtype=float) for k in self.inames}
+        self.jerrors = {k: jnp.asarray(self.errors[k], dtype=float) for k in self.inames}
+        self.jlm_arguments = {k: jnp.asarray(self.lm_arguments[k], dtype=float) for k in self.inames if self.lm_boolean[k]}
+
+        self._check_jax_support()
+
+        # Number of model evaluations to vectorize at once (e.g., over posterior samples or live points), chosen so that
+        # each batch uses ~1/5 of the accelerator's memory (~1.2 GB on CPUs): roughly 64 floats per model point (times the
+        # supersampling factor) plus N^2 for dense GPs.
+        floats = 0.
+        for instrument in self.inames:
+            d = self.dictionary[instrument]
+            n = self.ndatapoints_per_instrument[instrument]
+            floats += 64. * n * (d.get('nresampling', 1) if d.get('resampling', False) else 1)
+            if d.get('GPDetrend', False) and not d['noise_model'].use_celerite:
+                floats += 3. * n**2
+        if self.global_model and self.dictionary['global_model']['GPDetrend'] and not self.dictionary['global_model']['noise_model'].use_celerite:
+            floats += 3. * len(self.t)**2
+        budget_floats = 1.5e8
+        try:
+            memory = jax.devices()[0].memory_stats()
+            if memory is not None and 'bytes_limit' in memory:
+                budget_floats = max(budget_floats, 0.2 * memory['bytes_limit'] / 8.)
+        except Exception:
+            pass
+        self.batch_size = int(np.clip(budget_floats / max(floats, 1.), 1, 4096))
+
+        # jit-compiled functions:
+        self._log_likelihood_jit = jax.jit(self.log_likelihood_fn)
+        self._generate_jit = jax.jit(self._generate_fn)
+
 
 class gaussian_process(object):
     """
@@ -5248,6 +3125,9 @@ class gaussian_process(object):
     an instrument name, this object generates a Gaussian Process (GP) object to use within the juliet library. Example usage:
 
                >>> GPmodel = juliet.gaussian_process(data, model_type = 'lc', instrument = 'TESS')
+
+    celerite kernels are evaluated with celerite2.jax; the multi-dimensional squared-exponential, Matern 3/2 and exp-sine-squared
+    kernels (previously evaluated with george) are evaluated with dense JAX linear algebra.
 
     :param data (juliet.load object)
         Object containing all the information about the current dataset. This will help in determining the type of kernel
@@ -5261,9 +3141,19 @@ class gaussian_process(object):
         dictionary.
 
     :param george_hodlr: (optional, boolean)
-        If True, this uses George's HODLR solver (faster).
+        Kept for back-compatibility; it has no effect.
+
+    :param matern_eps: (optional, float)
+        Epsilon parameter for the (approximate) Matern kernels.
 
     """
+
+    def __new__(cls, data, *args, **kwargs):
+        # Data loaded with backend = 'legacy' are handled by the legacy implementation:
+        if getattr(data, 'backend', 'jax') == 'legacy':
+            from .legacy.fit import gaussian_process as legacy_class
+            return legacy_class(data, *args, **kwargs)
+        return super().__new__(cls)
 
     def get_kernel_name(self, priors):
 
@@ -5283,226 +3173,40 @@ class gaussian_process(object):
             )
 
         for kernel_name in self.all_kernel_variables.keys():
-            counter = 0
-            for variable_name in self.all_kernel_variables[kernel_name]:
-                if variable_name in variables_that_match:
-                    counter += 1
-            if (n_variables_that_match
-                    == counter) and (len(self.all_kernel_variables[kernel_name])
-                                     == n_variables_that_match):
+            if sorted(self.all_kernel_variables[kernel_name]) == sorted(variables_that_match):
                 return kernel_name
 
-    def init_GP(self):
-        if self.use_celerite:
-            self.GP = celerite.GP(self.kernel, mean=0.0)
-        else:
-            if self.global_GP:
-                if self.george_hodlr:
-                    self.GP = george.GP(self.kernel, mean = 0.0, fit_mean = False,\
-                                        fit_white_noise = False, solver = george.HODLRSolver)
-                else:
-                    self.GP = george.GP(self.kernel, mean = 0.0, fit_mean = False,\
-                                        fit_white_noise = False)
-            else:
-                # (Note no jitter kernel is given, as with george one defines this in the george.GP call):
-                jitter_term = george.modeling.ConstantModel(1.)
-                if self.george_hodlr:
-                    self.GP = george.GP(self.kernel, mean = 0.0, fit_mean = False, white_noise = jitter_term,\
-                                        fit_white_noise = True, solver = george.HODLRSolver)
-                else:
-                    self.GP = george.GP(self.kernel, mean = 0.0, fit_mean = False, white_noise = jitter_term,\
-                                        fit_white_noise = True)
-        self.compute_GP()
-
-    def compute_GP(self, X=None):
-        if self.yerr is not None:
-            if X is None:
-                self.GP.compute(self.X, yerr=self.yerr)
-            else:
-                self.GP.compute(X, yerr=self.yerr)
-        else:
-            if X is None:
-                self.GP.compute(self.X)
-            else:
-                self.GP.compute(X)
+        raise Exception('Input error: GP hyperparameters ' + ', '.join(variables_that_match) + ' for instrument ' +
+                        self.instrument + ' do not match any of the implemented kernels.')
 
     def set_input_instrument(self, input_variables):
 
         # This function sets the "input instrument" (self.input_instrument) name for each variable (self.variables).
         # If, for example, GP_Prot_TESS_K2_rv and GP_Gamma_TESS, and self.variables = ['Prot','Gamma'],
         # then self.input_instrument = ['TESS_K2_rv','TESS'].
-        for i in range(len(self.variables)):
-            GPvariable = self.variables[i]
-            for pnames in input_variables.keys():
-                vec = pnames.split('_')
-                if (vec[0] == 'GP') and (GPvariable
-                                         in vec[1]) and (self.instrument
-                                                         in vec):
+        self.input_instrument = []
+        self.parameter_names = {}
+        for GPvariable in self.variables:
+            for pname in input_variables.keys():
+                vec = pname.split('_')
+                if (vec[0] == 'GP') and (vec[1] == GPvariable) and (self.instrument in vec):
                     self.input_instrument.append('_'.join(vec[2:]))
+                    self.parameter_names[GPvariable] = pname
 
-    def set_parameter_vector(self, parameter_values):
-        # To update the parameters, we have to transform the juliet inputs to celerite/george inputs. Update this
-        # depending on the kernel under usage. For this, we first define a base_index variable that will define the numbering
-        # of the self.parameter_vector. The reason for this is that the dimensions of the self.parameter_vector array is
-        # different if the GP is global (i.e., self.global_GP is True --- meaning a unique GP is fitted to all instruments) or
-        # not (self.global_GP is False --- meaning a different GP per instrument is fitted). If the former, the jitter terms are
-        # modified directly by changing the self.yerr vector; in the latter, we have to manually add a jitter term in the GP parameter
-        # vector. This base_index is only important for the george kernels though --- an if statement suffices for the celerite ones.
-        base_index = 0
-        if (self.kernel_name == 'SEKernel') or (self.kernel_name
-                                                == 'M32Kernel'):
-            if not self.global_GP:
-                self.parameter_vector[base_index] = np.log(
-                    (parameter_values['sigma_w_' + self.instrument] *
-                     self.sigma_factor)**2)
-                base_index += 1
-            self.parameter_vector[base_index] = np.log(
-                (parameter_values['GP_sigma_' + self.input_instrument[0]] *
-                 self.sigma_factor)**2.)
-            alpha_name = 'alpha' if self.kernel_name == 'SEKernel' else 'malpha'
-            for i in range(self.nX):
-                self.parameter_vector[base_index + 1 + i] = np.log(
-                    1. / parameter_values[f'GP_{alpha_name}' + str(i) + '_' +
-                                          self.input_instrument[1 + i]])
-        elif self.kernel_name == 'ExpSineSquaredSEKernel':
-            if not self.global_GP:
-                self.parameter_vector[base_index] = np.log(
-                    (parameter_values['sigma_w_' + self.instrument] *
-                     self.sigma_factor)**2)
-                base_index += 1
-            self.parameter_vector[base_index] = np.log(
-                (parameter_values['GP_sigma_' + self.input_instrument[0]] *
-                 self.sigma_factor)**2.)
-            self.parameter_vector[base_index + 1] = np.log(
-                1. / (parameter_values['GP_alpha_' + self.input_instrument[1]]))
-            self.parameter_vector[base_index + 2] = np.log( 
-                parameter_values['GP_Gamma_' + self.input_instrument[2]])
-            self.parameter_vector[base_index + 3] = np.log(
-                parameter_values['GP_Prot_' + self.input_instrument[3]])
-        elif self.kernel_name == 'CeleriteQPKernel':
-            self.parameter_vector[0] = np.log(
-                parameter_values['GP_B_' + self.input_instrument[0]])
-            self.parameter_vector[1] = np.log(
-                parameter_values['GP_L_' + self.input_instrument[1]])
-            self.parameter_vector[2] = np.log(
-                parameter_values['GP_Prot_' + self.input_instrument[2]])
-            self.parameter_vector[3] = np.log(
-                parameter_values['GP_C_' + self.input_instrument[3]])
-            if not self.global_GP:
-                self.parameter_vector[4] = np.log(
-                    parameter_values['sigma_w_' + self.instrument] *
-                    self.sigma_factor)
-        elif self.kernel_name == 'CeleriteExpKernel':
-            self.parameter_vector[0] = np.log(
-                parameter_values['GP_sigma_' + self.input_instrument[0]])
-            self.parameter_vector[1] = np.log(
-                parameter_values['GP_timescale_' + self.input_instrument[1]])
-            if not self.global_GP:
-                self.parameter_vector[2] = np.log(
-                    parameter_values['sigma_w_' + self.instrument] *
-                    self.sigma_factor)
-        elif self.kernel_name == 'CeleriteMaternKernel':
-            self.parameter_vector[0] = np.log(
-                parameter_values['GP_sigma_' + self.input_instrument[0]])
-            self.parameter_vector[1] = np.log(
-                parameter_values['GP_rho_' + self.input_instrument[1]])
-            if not self.global_GP:
-                self.parameter_vector[2] = np.log(
-                    parameter_values['sigma_w_' + self.instrument] *
-                    self.sigma_factor)
-        elif self.kernel_name == 'CeleriteMaternExpKernel':
-            self.parameter_vector[0] = np.log(
-                parameter_values['GP_sigma_' + self.input_instrument[0]])
-            self.parameter_vector[1] = np.log(
-                parameter_values['GP_timescale_' + self.input_instrument[1]])
-            self.parameter_vector[3] = np.log(
-                parameter_values['GP_rho_' + self.input_instrument[2]])
-            if not self.global_GP:
-                self.parameter_vector[4] = np.log(
-                    parameter_values['sigma_w_' + self.instrument] *
-                    self.sigma_factor)
-        elif self.kernel_name == 'CeleriteSHOKernel':
-            self.parameter_vector[0] = np.log(
-                parameter_values['GP_S0_' + self.input_instrument[0]])
-            self.parameter_vector[1] = np.log(
-                parameter_values['GP_Q_' + self.input_instrument[1]])
-            self.parameter_vector[2] = np.log(
-                parameter_values['GP_omega0_' + self.input_instrument[2]])
-            
-            if not self.global_GP:
+    def hyperparameters(self, parameter_values):
+        """Dictionary with the values of the hyperparameters of the kernel."""
+        return {v: parameter_values[self.parameter_names[v]] for v in self.variables}
 
-                self.parameter_vector[3] = np.log(
-                    parameter_values['sigma_w_' + self.instrument] *
-                    self.sigma_factor)
-                
-        elif self.kernel_name == 'CeleriteDoubleSHOKernel':
-            # The parametrization follows the "RotationTerm" implemented in
-            # celerite2 https://celerite2.readthedocs.io/en/latest/api/python/#celerite2.terms.RotationTerm
-            sigma = parameter_values['GP_sigma_' + self.input_instrument[0]]
-            Q0 = parameter_values['GP_Q0_' + self.input_instrument[1]]
-            P = parameter_values['GP_period_' + self.input_instrument[2]]
-            f = parameter_values['GP_f_' + self.input_instrument[3]]
-            dQ = parameter_values['GP_dQ_' + self.input_instrument[4]]
+    def log_likelihood(self, parameter_values, residuals, variances):
+        """
+        GP log-likelihood of the residuals. ``variances`` are the variances added to the diagonal of the covariance
+        matrix (errorbars squared plus jitter terms squared).
+        """
+        return self.GP.log_likelihood(self.hyperparameters(parameter_values), residuals, variances)
 
-            Q1 = 1 / 2 + Q0 + dQ
-            omega1 = 4 * np.pi * Q1 / (P * np.sqrt(4 * Q1**2 - 1))
-            S1 = sigma**2 / ((1 + f) * omega1 * Q1)
-
-            Q2 = 1 / 2 + Q0
-            omega2 = 8 * np.pi * Q1 / (P * np.sqrt(4 * Q1**2 - 1))
-            S2 = f * sigma**2 / ((1 + f) * omega2 * Q2)
-
-            self.parameter_vector[0] = np.log(S1)
-            self.parameter_vector[1] = np.log(Q1)
-            self.parameter_vector[2] = np.log(omega1)
-            self.parameter_vector[3] = np.log(S2)
-            self.parameter_vector[4] = np.log(Q2)
-            self.parameter_vector[5] = np.log(omega2)
-
-            if not self.global_GP:
-
-                self.parameter_vector[6] = np.log(
-                    parameter_values['sigma_w_' + self.instrument] *
-                    self.sigma_factor)
-
-        elif self.kernel_name == 'CeleriteTripleSHOKernel':
-            self.parameter_vector[0] = np.log(
-                parameter_values['GP_S0_' + self.input_instrument[0]])
-            self.parameter_vector[1] = np.log(
-                parameter_values['GP_Q0_' + self.input_instrument[1]])
-            self.parameter_vector[2] = np.log(
-                2 * np.pi /
-                parameter_values['GP_period_' + self.input_instrument[2]])
-            self.parameter_vector[3] = np.log(
-                parameter_values['GP_f_' + self.input_instrument[3]] *
-                parameter_values['GP_S0_' + self.input_instrument[0]])
-            self.parameter_vector[4] = np.log(
-                parameter_values['GP_Q0_' + self.input_instrument[1]] -
-                parameter_values['GP_dQ_' + self.input_instrument[4]])
-            self.parameter_vector[5] = np.log(
-                np.pi /
-                parameter_values['GP_period_' + self.input_instrument[2]])
-            self.parameter_vector[6] = np.log(
-                parameter_values['GP_S0sc_' + self.input_instrument[5]])
-            self.parameter_vector[7] = np.log(
-                parameter_values['GP_omega0sc_' + self.input_instrument[6]])
-
-            if not self.global_GP:
-                self.parameter_vector[8] = np.log(
-                    parameter_values['sigma_w_' + self.instrument] *
-                    self.sigma_factor)
-        
-        # For Matern+SHO kernel
-        elif self.kernel_name == 'CeleriteMaternSHOKernel':
-            self.parameter_vector[0] = np.log(parameter_values['GP_sigma_'+self.input_instrument[0]])
-            self.parameter_vector[1] = np.log(parameter_values['GP_rho_'+self.input_instrument[1]])
-            self.parameter_vector[2] = np.log(parameter_values['GP_S0_'+self.input_instrument[2]])
-            self.parameter_vector[3] = np.log(parameter_values['GP_Q_'+self.input_instrument[3]])
-            self.parameter_vector[4] = np.log(parameter_values['GP_omega0_'+self.input_instrument[4]])
-            if not self.global_GP:
-                self.parameter_vector[5] = np.log(parameter_values['sigma_w_'+self.instrument]*self.sigma_factor)
-                
-        self.GP.set_parameter_vector(self.parameter_vector)
+    def predict(self, parameter_values, residuals, variances, X=None):
+        """Mean GP prediction at regressors X (default: the regressors of the fit) conditioned on the residuals."""
+        return self.GP.predict(self.hyperparameters(parameter_values), residuals, variances, X)
 
     def __init__(self,
                  data,
@@ -5570,6 +3274,7 @@ class gaussian_process(object):
                 self.yerr = None
 
         # Fix sizes of regressors if wrong:
+        self.X = np.asarray(self.X, dtype=float)
         if len(self.X.shape) == 2:
             if self.X.shape[1] != 1:
                 self.nX = self.X.shape[1]
@@ -5580,202 +3285,23 @@ class gaussian_process(object):
             self.nX = 1
 
         # Define all possible kernels available by the object:
-        self.all_kernel_variables = {}
-        self.all_kernel_variables['SEKernel'] = ['sigma']
-        self.all_kernel_variables['M32Kernel'] = ['sigma']
-        for i in range(self.nX):
-            self.all_kernel_variables['SEKernel'] = self.all_kernel_variables[
-                'SEKernel'] + ['alpha' + str(i)]
-            self.all_kernel_variables['M32Kernel'] = self.all_kernel_variables[
-                'M32Kernel'] + ['malpha' + str(i)]
-        self.all_kernel_variables['ExpSineSquaredSEKernel'] = [
-            'sigma', 'alpha', 'Gamma', 'Prot'
-        ]
-        self.all_kernel_variables['CeleriteQPKernel'] = ['B', 'L', 'Prot', 'C']
-        self.all_kernel_variables['CeleriteExpKernel'] = ['sigma', 'timescale']
-        self.all_kernel_variables['CeleriteMaternKernel'] = ['sigma', 'rho']
-        self.all_kernel_variables['CeleriteMaternExpKernel'] = [
-            'sigma', 'timescale', 'rho'
-        ]
-        self.all_kernel_variables['CeleriteSHOKernel'] = ['S0', 'Q', 'omega0']
-        self.all_kernel_variables['CeleriteDoubleSHOKernel'] = [
-            'sigma', 'Q0', 'period', 'f', 'dQ'
-        ]
-        # For Matern+SHO kernel
-        self.all_kernel_variables['CeleriteMaternSHOKernel'] = ['sigma', 'rho', 'S0', 'Q', 'omega0']
+        self.all_kernel_variables = kernel_variables(self.nX)
 
         # Find kernel name (and save it to self.kernel_name):
         self.kernel_name = self.get_kernel_name(data.priors)
-        # Initialize variable for the GP object:
-        self.GP = None
-        # Are we using celerite?
-        self.use_celerite = False
-        # Are we using george_hodlr?
-        if george_hodlr:
-            self.george_hodlr = True
-        else:
-            self.george_hodlr = False
-        # Initialize variable that sets the "instrument" name for each variable (self.variables below). If, for example,
-        # GP_Prot_TESS_K2_RV and GP_Gamma_TESS, and self.variables = [Prot,Gamma], then self.instrument_variables = ['TESS_K2_RV','TESS'].
-        self.input_instrument = []
-
-        # Initialize each kernel on the GP object. First, set the variables to the ones defined above. Then initialize the
-        # actual kernel:
         self.variables = self.all_kernel_variables[self.kernel_name]
-        phantomvariable = 0
-        if self.kernel_name == 'SEKernel':
-            # Generate GPExpSquared base kernel:
-            self.kernel = 1. * george.kernels.ExpSquaredKernel(
-                np.ones(self.nX), ndim=self.nX, axes=range(self.nX))
-            # (Note no jitter kernel is given, as with george one defines this in the george.GP call):
-        elif self.kernel_name == 'M32Kernel':
-            # Generate GPMatern32 base kernel:
-            self.kernel = 1. * george.kernels.Matern32Kernel(
-                np.ones(self.nX), ndim=self.nX, axes=range(self.nX))
-            # (Note no jitter kernel is given, as with george one defines this in the george.GP call):
-        elif self.kernel_name == 'ExpSineSquaredSEKernel':
-            # Generate the kernels:
-            K1 = 1. * george.kernels.ExpSquaredKernel(metric=1.0)
-            K2 = george.kernels.ExpSine2Kernel(gamma=1.0, log_period=1.0)
-            self.kernel = K1 * K2
-            # (Note no jitter kernel is given, as with george one defines this in the george.GP call):
-        elif self.kernel_name == 'CeleriteQPKernel':
-            # Generate rotational kernel:
-            rot_kernel = terms.TermSum(RotationTerm(log_amp=np.log(10.),\
-                                                    log_timescale=np.log(10.0),\
-                                                    log_period=np.log(3.0),\
-                                                    log_factor=np.log(1.0)))
-            # Jitter term:
-            kernel_jitter = terms.JitterTerm(np.log(100 * 1e-6))
-            # Wrap GP kernel and object:
-
-            if self.instrument in ['rv', 'lc']:
-
-                self.kernel = rot_kernel
-            else:
-                self.kernel = rot_kernel + kernel_jitter
-            # We are using celerite:
-            self.use_celerite = True
-        elif self.kernel_name == 'CeleriteExpKernel':
-            # Generate exponential kernel:
-            exp_kernel = terms.RealTerm(log_a=np.log(10.), log_c=np.log(10.))
-            # Jitter term:
-            kernel_jitter = terms.JitterTerm(np.log(100 * 1e-6))
-            # Wrap GP kernel and object:
-            if self.instrument in ['rv', 'lc']:
-                self.kernel = exp_kernel
-            else:
-                self.kernel = exp_kernel + kernel_jitter
-            # We are using celerite:
-            self.use_celerite = True
-        elif self.kernel_name == 'CeleriteMaternKernel':
-            # Generate matern kernel:
-            matern_kernel = terms.Matern32Term(log_sigma=np.log(10.),
-                                               log_rho=np.log(10.),
-                                               eps=matern_eps)
-            # Jitter term:
-            kernel_jitter = terms.JitterTerm(np.log(100 * 1e-6))
-            # Wrap GP kernel and object:
-            if self.instrument in ['rv', 'lc']:
-                self.kernel = matern_kernel
-            else:
-                self.kernel = matern_kernel + kernel_jitter
-            # We are using celerite:
-            self.use_celerite = True
-        elif self.kernel_name == 'CeleriteMaternExpKernel':
-            # Generate matern and exponential kernels:
-            matern_kernel = terms.Matern32Term(log_sigma=np.log(10.),
-                                               log_rho=np.log(10.),
-                                               eps=matern_eps)
-            exp_kernel = terms.RealTerm(log_a=np.log(10.), log_c=np.log(10.))
-            # Jitter term:
-            kernel_jitter = terms.JitterTerm(np.log(100 * 1e-6))
-            # Wrap GP kernel and object:
-            if self.instrument in ['rv', 'lc']:
-                self.kernel = exp_kernel * matern_kernel
-            else:
-
-                self.kernel = exp_kernel * matern_kernel + kernel_jitter
-
-            # We add a phantom variable because we want to leave index 2 without value ON PURPOSE: the idea is
-            # that here, that is always 0 (because this defines the log(sigma) of the matern kernel in the
-            # multiplication, which we set to 1).
-            phantomvariable = 1
-            # We are using celerite:
-            self.use_celerite = True
-        elif self.kernel_name == 'CeleriteSHOKernel':
-            # Generate kernel:
-            sho_kernel = terms.SHOTerm(log_S0=np.log(10.),
-                                       log_Q=np.log(10.),
-                                       log_omega0=np.log(10.))
-            # Jitter term:
-            kernel_jitter = terms.JitterTerm(np.log(100 * 1e-6))
-            # Wrap GP kernel and object:
-            if self.instrument in ['rv', 'lc']:
-                self.kernel = sho_kernel
-            else:
-                self.kernel = sho_kernel + kernel_jitter
-            # We are using celerite:
-            self.use_celerite = True
-        elif self.kernel_name == 'CeleriteDoubleSHOKernel':
-            # Generate kernel
-            #This kernel is adapted from the "RotationTerm" in celerite2 https://celerite2.readthedocs.io/en/latest/api/python/#celerite2.terms.RotationTerm
-            sho_kernel1 = terms.SHOTerm(log_S0=np.log(10.),
-                                        log_Q=np.log(10.),
-                                        log_omega0=np.log(10.))
-            sho_kernel2 = terms.SHOTerm(log_S0=np.log(10.),
-                                        log_Q=np.log(10.),
-                                        log_omega0=np.log(10.))
-
-            double_sho_kernel = sho_kernel1 + sho_kernel2
-
-            phantomvariable = 1
-            # Jitter term:
-            kernel_jitter = terms.JitterTerm(np.log(100 * 1e-6))
-            # Wrap GP kernel and object:
-            if self.instrument in ['rv', 'lc']:
-                self.kernel = double_sho_kernel
-            else:
-                self.kernel = double_sho_kernel + kernel_jitter
-            # We are using celerite:
-            self.use_celerite = True
-        ## For Matern+SHO kernel
-        elif self.kernel_name == 'CeleriteMaternSHOKernel':
-            # Matern kernel:
-            matern_kernel = terms.Matern32Term(log_sigma=np.log(10.), log_rho=np.log(10.), eps = matern_eps)
-            # SHO kernel:
-            sho_kernel = terms.SHOTerm(log_S0=np.log(10.), log_Q=np.log(10.),log_omega0=np.log(10.))
-            # Jitter term:
-            kernel_jitter = terms.JitterTerm(np.log(100*1e-6))
-            # Wrap GP kernel and object:
-            if self.instrument in ['rv','lc']:
-                self.kernel = matern_kernel + sho_kernel
-            else:
-                self.kernel = matern_kernel + sho_kernel + kernel_jitter
-            # And we are using celerite
-            self.use_celerite = True
-        # Check if use_celerite is True; if True, check that the regressor is ordered. If not, don't do the self.init_GP():
-        if self.use_celerite:
-            idx_sorted = np.argsort(self.X)
-            lX = len(self.X)
-            diff1 = np.count_nonzero(self.X - self.X[idx_sorted])
-            diff2 = np.count_nonzero(self.X - self.X[idx_sorted[::-1]])
-            if diff1 == 0 or diff2 == 0:
-                self.init_GP()
-                self.isInit = True
-        else:
-            self.init_GP()
-            self.isInit = True
-
-        if self.global_GP:
-            # If instrument is 'rv' or 'lc', assume GP object will fit for a global GP
-            # (e.g., global photometric signal, or global RV signal) that assumes a given
-            # GP realization for all instruments (but allows different jitters for each
-            # instrument, added in quadrature to the self.yerr):
-            self.parameter_vector = np.zeros(
-                len(self.variables) + phantomvariable)
-        else:
-            # If GP per instrument, then there is one jitter term per instrument directly added in the model:
-            self.parameter_vector = np.zeros(
-                len(self.variables) + 1 + phantomvariable)
+        self.use_celerite = 'Celerite' in self.kernel_name
+        self.george_hodlr = george_hodlr
         self.set_input_instrument(data.priors)
+
+        # Regressors of celerite kernels don't need to be sorted (this is handled internally). However, as in previous juliet
+        # versions, the data of global models are sorted by the GP regressor (this is done by juliet.load when isInit is False):
+        if self.use_celerite and self.global_GP:
+            if not (np.all(np.diff(self.X) >= 0) or np.all(np.diff(self.X) <= 0)):
+                return
+
+        # Initialize the (JAX) GP object:
+        self.legacy_gp_parametrization = getattr(data, 'legacy_gp_parametrization', False)
+        self.GP = JaxGP(self.kernel_name, self.X, self.sigma_factor, matern_eps=matern_eps,
+                        legacy_parametrization=self.legacy_gp_parametrization)
+        self.isInit = True

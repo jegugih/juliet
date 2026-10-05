@@ -4,6 +4,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+### Added
+- `backend` option of `juliet.load`: `'jax'` (default) or `'legacy'` (the original implementation with batman, catwoman, radvel, george and celerite, and MultiNest, dynesty, UltraNest, emcee and zeus as samplers).
+- `legacy_gp_parametrization` option of `juliet.load` (see Fixed).
+- `sampler = 'nautilus'` (neural-network-boosted importance nested sampling with `nautilus-sampler`).
+- `batch_size` keyword of `juliet.fit`: likelihoods evaluated over many points at once (live points, walkers, posterior samples) are vectorized in chunks of `batch_size`, chosen by default so that each chunk uses ~1 GB.
+- `docs/known_issues_original.md`, listing the issues found in juliet 2.2.10 and its dependencies.
+### Changed
+- juliet's backend is now written in JAX. Lightcurves are computed with `jaxoplanet` (Kepler solver plus polynomial limb-darkening), RVs with `jaxoplanet`'s Keplerian systems, and GPs with `celerite2`'s kernels and a pure-JAX implementation of the celerite algorithm (runs on CPUs and GPUs, can be vmapped and differentiated) or dense JAX linear algebra (the former `george` kernels). The likelihood is a pure, jit-compiled function of the parameters.
+- Samplers are now JAX samplers: `sampler = 'nested'` (default; batched nested slice sampling from `blackjax`, which also returns `lnZ`), `'nuts'` (`numpyro`), `'emcee'` (`numpyro`'s `AIES`) and `'zeus'` (`numpyro`'s `ESS`). The names of the previous nested samplers (`multinest`, `dynesty`, `dynamic_dynesty`, `ultranest`, `slicesampler_ultranest`) map to `'nested'`. Output files are named `[sampler]_posteriors.pkl`.
+- For MCMC samplers, `posteriors_per_walker` (shape `(nsteps, nwalkers, nparams)`) no longer includes the burn-in steps.
+- `non_linear_functions` and `extra_loglikelihood` functions are best written with `jax.numpy`; NumPy functions are evaluated through `jax.pure_callback` (not available with `sampler = 'nuts'`).
+- Square-root, logarithmic, exponential, power-2 and non-linear limb-darkening laws are computed by numerical integration in JAX, accurate to ~1e-9 in relative flux (more accurate than `batman`, whose step size is set at initialization, and in particular for the exponential law near the stellar limb).
+- `catwoman` transits (planets with asymmetric limbs) are computed by numerical integration in JAX (with the same conventions as `catwoman`; they can not be combined with eclipses).
+- `kelp` phase curves are vendored in `juliet/kelp_jax.py` (the released `kelp` does not install with current Python, NumPy and JAX versions).
+- Orbital phases of `kelp` phase curves are measured from the time of transit implied by `t_secondary` (as in previous versions, where `batman` set it).
+- Regressors of celerite kernels no longer need to be sorted.
+- george kernels are now evaluated exactly (previously, george's approximate HODLR solver was used by default).
+- With a fixed `t_secondary`, eclipses are now always placed using `t_secondary` (previously, batman only used it on the first model evaluation).
+### Removed
+- Dependencies on `batman`, `radvel`, `catwoman`, `celerite`, `george`, `kelp`, `dynesty`, `pymultinest`, `ultranest`, `emcee` and `zeus`.
+- `utils.init_batman`, `utils.init_catwoman` and `utils.init_radvel`.
+### Fixed
+(See docs/known_issues_original.md for details and for which fixes also apply to the legacy backend.)
+- The exp-sine-squared GP kernel now uses `GP_Gamma` (it used `log(GP_Gamma)`), and the multi-dimensional squared-exponential and Matern 3/2 kernels now have a variance of `GP_sigma**2` (it was `nX * GP_sigma**2` for `nX` regressors, because of a bug in george's `ConstantKernel`). `legacy_gp_parametrization = True` restores the previous behaviour.
+- Global models without a GP now return their log-likelihood (it was previously not returned).
+- `extra_loglikelihood` is now added to the likelihood (it previously referenced an undefined variable).
+- Re-loading posteriors with `sigma_w_rv_*` names, and the error message for unknown model types, no longer crash.
+- `evaluate()` no longer returns a zero model when the posterior has fewer samples than `nsamples`; components with several RV instruments and evaluations at new times with TTVs work.
+- `get_quantiles` works for small numbers of samples.
+- Beta priors had a log-density of `-inf` for `b >= 1` (MCMC samplers); exponential priors crashed dynesty with NumPy 2.
+- Prior dictionaries with `sigma_w_rv_*` names are renamed as prior files are (they made RV models global and crashed).
+- `juliet.load` no longer sorts the user's GP regressor arrays in place.
+- `juliet.plots` imports with current matplotlib versions; optional dependencies in `setup.py` (`extras_require`).
+
 ## [2.2.10] - 2026-02-16
 ### Fixed
 - Bug on catwoman check.

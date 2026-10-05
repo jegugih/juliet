@@ -17,13 +17,14 @@ setup(name='juliet',
       author='Nestor Espinoza',
       author_email='nespinoza@stsci.edu',
       license='MIT',
-      packages=['juliet'],
-      install_requires=['batman-package','radvel','dynesty>=1.2.2','george','celerite','astropy','numpy','scipy', 'emcee', 'ultranest', 'h5py'],
-      python_requires='>=2.7',
-      extras_requires={
+      packages=['juliet', 'juliet.legacy'],
+      install_requires=['jax>=0.4.31','jaxoplanet>=0.1.0','celerite2>=0.3.3','numpyro>=0.15','blackjax>=1.7','astropy','numpy','scipy','h5py'],
+      python_requires='>=3.10',
+      extras_require={
             'seaborn':['seaborn'],
-            'pymultinest':['pymultinest'],
-            'matplotlib':['matplotlib'],},
+            'matplotlib':['matplotlib'],
+            'nautilus':['nautilus-sampler'],
+            'legacy':['batman-package','radvel','george','celerite','dynesty','emcee','ultranest','zeus-mcmc','setuptools'],},
       entry_points={
             'console_scripts': [
                  'juliet=juliet.__main__:main'
