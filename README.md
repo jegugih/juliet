@@ -11,6 +11,8 @@ Authors: Néstor Espinoza (nespinoza@stsci.edu) & Diana Kossakowski (kossakowski
 
 ### JAX backend
 
+Claude by Anthropic was used to convert the backend to JAX-based packages. Run the code at your own risk. 
+
 This version of `juliet` runs entirely on [JAX](https://github.com/jax-ml/jax): lightcurves (transits, eclipses and phase curves) are computed with [jaxoplanet](https://github.com/exoplanet-dev/jaxoplanet), radial velocities with `jaxoplanet`'s Keplerian systems and Gaussian Processes with [celerite2](https://github.com/exoplanet-dev/celerite2)'s kernels and a pure-JAX implementation of the celerite algorithm (the former `george` kernels use dense JAX linear algebra). The likelihood is a single jit-compiled function, and posteriors are sampled with JAX samplers:
 
 ```python
