@@ -65,6 +65,11 @@ for index, (name, make) in enumerate(PROBLEMS.items()):
     single = jax.jit(f._loglike_x)
     line = f'{name:52s} | single call: {timeit(single, jnp.asarray(X[0]), 30) * 1e3:9.3f} ms | chunk {f.batch_size}'
     batched = jax.jit(jax.vmap(chunked_vmap(jax.jit(f._loglike_x), f.batch_size)))
+    # (lnL of the first draw, to check that settings like JULIET_CELERITE_UNROLL leave the likelihood unchanged, and
+    # the compilation time of the largest batch)
+    t0 = time.time()
+    lnl0 = float(jax.block_until_ready(batched(jnp.asarray(X[:min(nmax, len(X))])))[0])
+    line += f' | lnL(x0) = {lnl0:.6f} | compile {time.time() - t0:.1f} s'
     for nb in args.batch:
         if nb <= len(X):
             line += f' | batch {nb}: {timeit(batched, jnp.asarray(X[:nb]), 3) / nb * 1e3:9.4f} ms/eval'

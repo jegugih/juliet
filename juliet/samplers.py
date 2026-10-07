@@ -119,5 +119,7 @@ def run_numpyro(kernel_name, potential_fn, initial_z, rng_key, num_warmup, num_s
     mcmc_kwargs.setdefault('progress_bar', True)
     mcmc = MCMC(kernel, num_warmup=num_warmup, num_samples=num_samples, num_chains=num_chains,
                 chain_method='vectorized', **mcmc_kwargs)
-    mcmc.run(rng_key, init_params=jnp.asarray(initial_z))
+    # (with one chain, numpyro expects initial positions without the chain dimension)
+    init_params = jnp.asarray(initial_z) if num_chains > 1 else jnp.asarray(initial_z)[0]
+    mcmc.run(rng_key, init_params=init_params)
     return np.asarray(mcmc.get_samples(group_by_chain=True)), mcmc

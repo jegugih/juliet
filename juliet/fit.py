@@ -1416,10 +1416,10 @@ class load(object):
 
 
 # Samplers available in the JAX backend. Nested sampling returns the log-evidence; the MCMC ones don't.
-nested_samplers = ['nested', 'nautilus']
+nested_samplers = ['nested', 'nautilus', 'ultranest', 'slicesampler_ultranest']
 mcmc_samplers = ['nuts', 'emcee', 'zeus']
 # Names of samplers of previous (non-JAX) juliet versions; these are now run with the JAX nested sampler:
-legacy_nested_samplers = ['multinest', 'dynesty', 'dynamic_dynesty', 'ultranest', 'slicesampler_ultranest']
+legacy_nested_samplers = ['multinest', 'dynesty', 'dynamic_dynesty']
 
 
 def _matching_kwargs(function, kwargs):
@@ -1513,6 +1513,13 @@ class fit(object):
       nautilus spends much of its run time training neural networks on one CPU core. To train them in parallel while the
       batched likelihood stays in the main process, pass a pool for its sampler calculations, e.g.,
       ``pool = (None, multiprocessing.get_context('fork').Pool(4))`` (a 'fork' pool does not re-import the calling script).
+    - ``ultranest`` / ``slicesampler_ultranest`` (needs ``ultranest``): UltraNest's ``ReactiveNestedSampler`` with a vectorized
+      likelihood; ``n_live_points`` is ``min_num_live_points``. ``ultranest`` samples from UltraNest's MLFriends regions
+      (best in low dimensions); ``slicesampler_ultranest`` uses its vectorized ``PopulationSliceSampler``, with ``popsize`` walkers
+      evolved at once (default ``n_live_points // 2``), ``num_inner_steps`` slice steps per new point (default
+      ``max(5, 2 * ndim)``) and ``generate_direction`` (default ``generate_mixture_random_direction``). Any argument of
+      ``ultranest.ReactiveNestedSampler`` (e.g., ``ndraw_max``, ``log_dir`` to write UltraNest's output files) or of its ``run``
+      method (e.g., ``dlogz``, ``frac_remain``, ``max_num_improvement_loops``) can be given.
 
     Note that, as the likelihood is jit-compiled, any ``non_linear_functions`` or ``extra_loglikelihood`` given to ``juliet.load``
     are best written with ``jax.numpy``. Functions written with NumPy are evaluated through ``jax.pure_callback`` (slower, and not
@@ -1597,6 +1604,41 @@ class fit(object):
         lp = -jax.lax.map(jax.jit(self._potential_z), z, batch_size=self.batch_size)
         return z[jnp.argsort(-lp)[:n]]
 
+    def _unit_cube_prior(self):
+        # Vectorized prior transform of the unit hypercube for samplers that work there (nautilus, ultranest), with the
+        # same transforms as juliet's original nested samplers:
+        transforms = {'uniform': transform_uniform, 'normal': transform_normal, 'truncatednormal': transform_truncated_normal,
+                      'jeffreys': transform_loguniform, 'loguniform': transform_loguniform, 'beta': transform_beta,
+                      'exponential': transform_exponential, 'modjeffreys': transform_modifiedjeffreys}
+        prior_transforms = [(transforms[self.data.priors[p]['distribution'].lower()], self.data.priors[p]['hyperparameters'])
+                            for p in self.paramnames]
+
+        def prior(u):
+            x = np.empty_like(u)
+            for i, (transform, hyperparameters) in enumerate(prior_transforms):
+                x[:, i] = transform(u[:, i], hyperparameters)
+            return x
+
+        return prior
+
+    def _host_loglike(self, pad=False):
+        # Log-likelihood of an (n, nparams) NumPy array of physical parameters, evaluated in one batch, for samplers that
+        # run on the host (nautilus, ultranest). With pad = True, batches are padded to powers of two so that samplers
+        # proposing varying numbers of points don't trigger a new compilation for every batch size.
+        batched_loglike = jax.jit(jax.vmap(chunked_vmap(self._loglike_x_jit, self.batch_size)))
+
+        def likelihood(x):
+            n = len(x)
+            if n == 0:
+                return np.zeros(0)
+            if pad:
+                n_padded = max(64, 1 << (n - 1).bit_length())
+                x = np.concatenate([x, np.repeat(x[:1], n_padded - n, axis=0)])
+            log_like = np.asarray(batched_loglike(jnp.asarray(x)))[:n]
+            return np.where(np.isfinite(log_like), log_like, -1e300)
+
+        return likelihood
+
     def __init__(self, data, sampler = 'nested', n_live_points = 500, nwalkers = 100, nsteps = 300, nburnin = 500, emcee_factor = 1e-4, \
                  ecclim = 1., pl = 0.0, pu = 1.0, ta = 2458460., nthreads = None, light_travel_delay = False, stellar_radius = None, \
                  kelp_refl_interpolation_knots = None, kelp_thm_interpolation_knots = None, kelp_filt_wav = None, kelp_filt_trans = None,\
@@ -1634,13 +1676,22 @@ class fit(object):
 
         self.stellar_radius = stellar_radius
 
-        # Deprecated sampler flags; all nested samplers of previous versions are now the JAX nested sampler:
-        if use_ultranest or use_dynesty:
-            print('WARNING: use_ultranest and use_dynesty are deprecated; using the JAX nested sampler (sampler = "nested").')
+        # Deprecated sampler flags:
+        if use_ultranest:
+            print('WARNING: use_ultranest is deprecated; use sampler = "ultranest".')
+            self.sampler = 'ultranest'
+        elif use_dynesty:
+            print('WARNING: use_dynesty is deprecated; using the JAX nested sampler (sampler = "nested").')
             self.sampler = 'nested'
         if self.sampler in legacy_nested_samplers:
             print('Note: juliet now runs on JAX; sampler "' + self.sampler + '" is replaced by the JAX nested sampler (sampler = "nested").')
             self.sampler = 'nested'
+        if 'ultranest' in self.sampler:
+            try:
+                import ultranest
+            except ImportError:
+                print('Note: ultranest is not installed; using the JAX nested sampler (sampler = "nested") instead.')
+                self.sampler = 'nested'
         if self.sampler not in nested_samplers + mcmc_samplers:
             raise Exception('INPUT ERROR: sampler "' + self.sampler + '" not recognized. Options are: ' + ', '.join(nested_samplers + mcmc_samplers) + '.')
         if self.nthreads is not None:
@@ -1783,24 +1834,7 @@ class fit(object):
             elif self.sampler == 'nautilus':
 
                 import nautilus
-                # Prior transform of the unit hypercube (vectorized, with the same transforms as juliet's original nested samplers):
-                transforms = {'uniform': transform_uniform, 'normal': transform_normal, 'truncatednormal': transform_truncated_normal,
-                              'jeffreys': transform_loguniform, 'loguniform': transform_loguniform, 'beta': transform_beta,
-                              'exponential': transform_exponential, 'modjeffreys': transform_modifiedjeffreys}
-                prior_transforms = [(transforms[self.data.priors[p]['distribution'].lower()], self.data.priors[p]['hyperparameters'])
-                                    for p in self.paramnames]
-
-                def prior(u):
-                    x = np.empty_like(u)
-                    for i, (transform, hyperparameters) in enumerate(prior_transforms):
-                        x[:, i] = transform(u[:, i], hyperparameters)
-                    return x
-
-                batched_loglike = jax.jit(jax.vmap(chunked_vmap(self._loglike_x_jit, self.batch_size)))
-
-                def likelihood(x):
-                    log_like = np.asarray(batched_loglike(jnp.asarray(x)))
-                    return np.where(np.isfinite(log_like), log_like, -1e300)
+                prior, likelihood = self._unit_cube_prior(), self._host_loglike()
 
                 sampler_kwargs = dict(n_live=self.n_live_points, n_batch=kwargs.get('n_batch', 1000), seed=int(self.seed))
                 sampler_kwargs.update(_matching_kwargs(nautilus.Sampler.__init__, kwargs))
@@ -1815,6 +1849,42 @@ class fit(object):
                 out['nautilus_output'] = {'samples': points, 'logwt': log_w, 'loglikelihood': log_l, 'ess': ns.n_eff}
                 out['lnZ'] = float(ns.log_z)
                 out['lnZerr'] = float(1. / np.sqrt(ns.n_eff))
+
+            elif 'ultranest' in self.sampler:
+
+                import ultranest
+                # UltraNest's region sampler proposes varying numbers of points per call, so batches are padded:
+                prior, likelihood = self._unit_cube_prior(), self._host_loglike(pad=True)
+                np.random.seed(self.seed % 2**32)  # (ultranest draws from NumPy's global random number generator)
+
+                sampler_kwargs = dict(log_dir=None)
+                sampler_kwargs.update(_matching_kwargs(ultranest.ReactiveNestedSampler.__init__, kwargs))
+                for k in ['param_names', 'loglike', 'transform', 'vectorized']:
+                    sampler_kwargs.pop(k, None)
+                ns = ultranest.ReactiveNestedSampler(self.paramnames, likelihood, transform=prior, vectorized=True, **sampler_kwargs)
+
+                if self.sampler == 'slicesampler_ultranest':
+                    # Vectorized slice sampling: popsize walkers are evolved at once, each needing num_inner_steps slice steps
+                    # (same default as the JAX nested sampler):
+                    from ultranest import popstepsampler
+                    ns.stepsampler = popstepsampler.PopulationSliceSampler(
+                        popsize=kwargs.get('popsize', max(1, self.n_live_points // 2)),
+                        nsteps=kwargs.get('num_inner_steps', max(5, 2 * self.nparams)),
+                        generate_direction=kwargs.get('generate_direction', popstepsampler.generate_mixture_random_direction))
+
+                # Same defaults as juliet's original ultranest samplers:
+                run_kwargs = dict(min_num_live_points=self.n_live_points, frac_remain=0.1, max_num_improvement_loops=1,
+                                  show_status=self.data.verbose, viz_callback=False)
+                run_kwargs.update(_matching_kwargs(ultranest.ReactiveNestedSampler.run, kwargs))
+                results = ns.run(**run_kwargs)
+
+                posterior_samples = np.asarray(results['samples'])
+                weighted = results['weighted_samples']
+                out['ultranest_output'] = {'samples': np.asarray(weighted['points']), 'logwt': np.asarray(weighted['logw']),
+                                           'loglikelihood': np.asarray(weighted['logl']), 'ess': float(results['ess']),
+                                           'ncall': int(results['ncall'])}
+                out['lnZ'] = float(results['logz'])
+                out['lnZerr'] = float(results['logzerr'])
 
             else:
 

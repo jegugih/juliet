@@ -5,6 +5,7 @@
 #
 # Parametrizations reproduce exactly the parameter vectors juliet used to pass to celerite and george,
 # so posteriors are directly comparable with the ones obtained with previous juliet versions.
+import os
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -72,6 +73,11 @@ def celerite_term(kernel_name, h, matern_eps):
 # phi_nm = exp(-c (t_n - t_m)); (c, a, U, V) are given by celerite2's get_celerite_matrices.
 ##########################################################################################################
 
+# Number of data points per iteration of the celerite recursions (lax.scan's unroll). On GPUs each loop iteration has a
+# fixed launch cost, so unrolling cuts the latency of long time series; set with the JULIET_CELERITE_UNROLL variable.
+CELERITE_UNROLL = int(os.environ.get('JULIET_CELERITE_UNROLL', 1))
+
+
 def _celerite_step(c, carry, inputs):
     """One step of the Cholesky factorization K = L diag(d) L^T and of the forward solve L z = y."""
     S, F, t_prev, d_prev, W_prev, z_prev = carry
@@ -96,7 +102,7 @@ def _celerite_forward(t, c, a, U, V, y, store_carries=False):
     def step(carry, inputs):
         new_carry, out = _celerite_step(c, carry, inputs)
         return new_carry, (out, carry) if store_carries else out
-    return jax.lax.scan(step, _celerite_initial_carry(t, c, y.dtype), (t, a, U, V, y))[1]
+    return jax.lax.scan(step, _celerite_initial_carry(t, c, y.dtype), (t, a, U, V, y), unroll=CELERITE_UNROLL)[1]
 
 
 def _log_likelihood_from_innovations(d, z):
@@ -131,7 +137,8 @@ def _celerite_log_likelihood_bwd(residuals, g):
 
     zero_carry = jax.tree.map(lambda x: jnp.zeros_like(x[0]), carries)
     (_, c_bar), (t_b, a_b, U_b, V_b, y_b) = jax.lax.scan(back, (zero_carry, jnp.zeros_like(c)),
-                                                        (carries, (t, a, U, V, y), d_bar, z_bar), reverse=True)
+                                                        (carries, (t, a, U, V, y), d_bar, z_bar), reverse=True,
+                                                        unroll=CELERITE_UNROLL)
     return t_b, c_bar, a_b, U_b, V_b, y_b
 
 
@@ -151,7 +158,7 @@ def celerite_apply_inverse(t, c, a, U, V, y):
         x = zn - jnp.sum(Wn * F)
         return (F, tn, Un, x), x
     init = (jnp.zeros(J, y.dtype), t[-1], jnp.zeros(J, y.dtype), jnp.zeros((), y.dtype))
-    return jax.lax.scan(step, init, (t, U, W, z / d), reverse=True)[1]
+    return jax.lax.scan(step, init, (t, U, W, z / d), reverse=True, unroll=CELERITE_UNROLL)[1]
 
 
 def celerite_predict(term, t, diag, y, t_new):
@@ -170,7 +177,7 @@ def celerite_predict(term, t, diag, y, t_new):
         tn, Vn, an = inputs
         Q = jnp.exp(-c * (tn - t_prev)) * Q + Vn * an
         return (Q, tn), Q
-    Q = jax.lax.scan(forward, (jnp.zeros(J, y.dtype), t[0]), (t, V, alpha))[1]
+    Q = jax.lax.scan(forward, (jnp.zeros(J, y.dtype), t[0]), (t, V, alpha), unroll=CELERITE_UNROLL)[1]
 
     # R_n = sum_{m > n} U_m alpha_m exp(-c (t_m - t_n)):
     def backward(carry, inputs):
@@ -179,7 +186,7 @@ def celerite_predict(term, t, diag, y, t_new):
         R = jnp.exp(-c * (t_next - tn)) * (R + U_next * a_next)
         return (R, tn, Un, an), R
     R = jax.lax.scan(backward, (jnp.zeros(J, y.dtype), t[-1], jnp.zeros(J, y.dtype), jnp.zeros((), y.dtype)),
-                     (t, U, alpha), reverse=True)[1]
+                     (t, U, alpha), reverse=True, unroll=CELERITE_UNROLL)[1]
 
     # Contribution of the data points before (t_m <= t_new) and after (t_m > t_new) each prediction time:
     i = jnp.searchsorted(t, t_new, side='right') - 1

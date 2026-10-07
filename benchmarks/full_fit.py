@@ -49,7 +49,9 @@ def main():
         if args.backend == 'jax':
             fit_kwargs['seed'] = args.seed
         if args.sampler == 'nautilus' and args.train_procs > 1:
-            fit_kwargs['pool'] = (None, multiprocessing.get_context('fork').Pool(args.train_procs))
+            # (macOS crashes processes forked from a multithreaded parent, so use 'spawn' there)
+            start_method = 'spawn' if sys.platform == 'darwin' else 'fork'
+            fit_kwargs['pool'] = (None, multiprocessing.get_context(start_method).Pool(args.train_procs))
         results = data.fit(**fit_kwargs)
     elapsed = time.time() - t0
     post = results.posteriors
